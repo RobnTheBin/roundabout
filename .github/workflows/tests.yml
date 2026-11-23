@@ -33,5 +33,6 @@ jobs:
 
       - name: Build and validate the extension
         run: |
+          mkdir -p dist
           ./blender/blender --factory-startup --command extension build --source-dir roundabout --output-dir dist
           ./blender/blender --factory-startup --command extension validate dist/*.zip

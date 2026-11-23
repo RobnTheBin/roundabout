@@ -41,7 +41,7 @@ You can still orbit, pan and zoom the view with the middle mouse button while th
 
 - **Whole shape (W)** changes every connected loop of a cylinder at once, bevels included, and keeps all quads. **Selected loops** changes only what you picked and joins it to its neighbours with a few triangles.
 - **Bevels:** select one edge path across a bevel to change its segments, width (LMB drag) and roundness (RMB drag). The whole bevel updates together.
-- **Remove a bevel:** drag left until the radius hits 0 and apply. While you stay in Edit Mode you can bring it back: select the edge, press Alt+T and drag right.
+- **Remove a bevel:** drag left until the radius hits 0 and apply. While you stay in Edit Mode you can bring it back: select only that edge, press Alt+T and drag right.
 - The shortcut can be changed in the add-on's preferences. The tool is also in the **Edge** menu and the right-click menu.
 
 ## Limitations

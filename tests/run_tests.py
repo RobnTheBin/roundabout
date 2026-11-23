@@ -1345,6 +1345,27 @@ def curve_restore_forgotten_after_edit_mode():
 
 
 @test
+def remembered_collapse_ignored_when_more_is_selected():
+    # A remembered collapse only comes back when nothing else is selected:
+    # selecting it together with other loops scales those loops instead.
+    ob = make_profile_cylinder([(1.0, -1.0)] + arc())
+    bm = edit(ob)
+    select_column(bm, 0.7)
+    bmesh.update_edit_mesh(ob.data)
+    run_op(radius_scale=0.0)
+    bm = bmesh.from_edit_mesh(ob.data)
+    top, bottom = ring_pred(1.0), ring_pred(-1.0)
+    select_edges(bm, lambda e: top(e) or bottom(e))
+    bmesh.update_edit_mesh(ob.data)
+    expect(run_op(radius_scale=1.5) == {'FINISHED'}, "op failed")
+    bm = bmesh.from_edit_mesh(ob.data)
+    expect(len(bm.verts) == 32, f"{len(bm.verts)} verts: the bevel came back instead of scaling the loops")
+    r = max(v.co.xy.length for v in bm.verts)
+    expect(abs(r - 1.5) < 1e-3, f"loops should be scaled to radius 1.5, got {r:.4f}")
+    expect(not check_topology(bm), check_topology(bm))
+
+
+@test
 def plain_edge_radius_does_nothing():
     # A plain corner edge of a box is not a bevel: radius and collapse leave it alone.
     for scale in (0.0, 0.5, 2.0):

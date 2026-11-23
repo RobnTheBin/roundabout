@@ -91,7 +91,30 @@ def find(me, bm):
             verts = [bm.verts[i] for i in idx]
             if all(edge_between(a, b) is not None for a, b in zip(verts, verts[1:])):
                 out.append((rec, idx))
+    if out and not _selection_inside(bm, out):
+        return []
     return out
+
+
+def _selection_inside(bm, matches):
+    """True when nothing but collapsed edges is selected. A selection that
+    also holds other geometry (loops picked to resample or scale) is not a
+    request to bring a bevel back."""
+    verts = set()
+    edges = set()
+    for rec, idx in matches:
+        vs = [bm.verts[i] for i in idx]
+        verts.update(vs)
+        pairs = list(zip(vs, vs[1:]))
+        if rec.closed and len(vs) > 2:
+            pairs.append((vs[-1], vs[0]))
+        for a, b in pairs:
+            e = edge_between(a, b)
+            if e is not None:
+                edges.add(e)
+    if any(e.select and e not in edges for e in bm.edges):
+        return False
+    return not any(v.select and v not in verts for v in bm.verts)
 
 
 def expand(bm, matches, scale, targets, shift):

@@ -10,22 +10,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      BLENDER_URL: https://download.blender.org/release/Blender5.1/blender-5.1.2-linux-x64.tar.xz
+      BLENDER_VERSION: 5.1.2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Cache Blender
         id: cache
         uses: actions/cache@v4
         with:
           path: blender
-          key: ${{ env.BLENDER_URL }}
+          key: blender-${{ env.BLENDER_VERSION }}
 
       - name: Download Blender
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir blender
-          curl -sSL "$BLENDER_URL" | tar -xJ -C blender --strip-components=1
+        run: bash .github/scripts/get-blender.sh
 
       - name: Install runtime libraries
         run: sudo apt-get update && sudo apt-get install -y libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 libegl1

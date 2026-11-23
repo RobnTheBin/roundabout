@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "roundabout"
+version = "1.0.0"
+name = "Roundabout"
+tagline = "Resample loops, arcs and bevels with the mouse wheel"
+maintainer = "Robin Mariančík"
+type = "add-on"
+website = "https://github.com/RobnTheBin/roundabout"
+
+tags = ["Mesh", "Modeling"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Robin Mariančík"]

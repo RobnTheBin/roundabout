@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      BLENDER_URL: https://download.blender.org/release/Blender5.1/blender-5.1.2-linux-x64.tar.xz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the manifest version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' roundabout/blender_manifest.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match manifest version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Cache Blender
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: blender
+          key: ${{ env.BLENDER_URL }}
+
+      - name: Download Blender
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir blender
+          curl -sSL "$BLENDER_URL" | tar -xJ -C blender --strip-components=1
+
+      - name: Install runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 libegl1
+
+      - name: Build and validate the extension
+        run: |
+          ./blender/blender --factory-startup --command extension build --source-dir roundabout --output-dir dist
+          ./blender/blender --factory-startup --command extension validate "dist/roundabout-$VERSION.zip"
+
+      - name: Release notes from the changelog
+        run: |
+          awk -v v="## $VERSION" '$0==v{f=1;next} /^## /{f=0} f' CHANGELOG.md > notes.md
+          cat >> notes.md <<'NOTES'
+
+          ### Install
+          Download `roundabout-VERSION.zip` below. In Blender 4.2 or newer go to **Edit → Preferences → Get Extensions → ⌄ (top right) → Install from Disk…** and pick the zip. Then, in Edit Mode, select a loop and press **Alt+T**.
+          NOTES
+          sed -i "s/VERSION/$VERSION/" notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/roundabout-$VERSION.zip" \
+            --title "Roundabout $VERSION" --notes-file notes.md

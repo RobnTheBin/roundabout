@@ -45,20 +45,18 @@ CONFIRM = {'RET', 'NUMPAD_ENTER'}
 CANCEL = {'ESC'}
 
 STATUS_RINGS = (
-    "Wheel / +- : segments ±1    Ctrl+Wheel: multiple of 4    0-9: type a count    "
-    "LMB drag: radius (Ctrl: snap)    MMB click: fix loops to perfect circles    MMB drag: orbit    "
-    "W: selected loops / whole shape    Space: add loops with the same count    E / D: match highest / lowest count    F: fit mode    "
-    "LMB click / Alt+T / Enter: apply    Esc / RMB click: cancel"
+    "Wheel / +-: segments    Ctrl+Wheel: ×4    0-9: type    LMB drag: radius (Ctrl: snap)    "
+    "MMB: perfect circle    W: selected / whole    R: tidy    Space: select similar    "
+    "E / D: match max / min    F: fit    LMB / Enter: apply    Esc / RMB: cancel"
 )
 STATUS_CURVES = (
-    "Wheel / +- : segments ±1    Ctrl+Wheel: multiple of 4    0-9: type a count    "
-    "LMB drag: radius    RMB drag: tension    (Ctrl: snap)    MMB click: even spacing    MMB drag: orbit    "
-    "E / D: match highest / lowest count    "
-    "F: fit mode    LMB click / Alt+T / Enter: apply    Esc / RMB click: cancel"
+    "Wheel / +-: segments    Ctrl+Wheel: ×4    0-9: type    LMB drag: radius    RMB drag: tension    "
+    "(Ctrl: snap)    MMB: even spacing    W: selected / whole    R: tidy    E / D: match max / min    "
+    "F: fit    LMB / Enter: apply    Esc / RMB: cancel"
 )
 STATUS_RESTORE = (
-    "LMB drag: bring the collapsed bevel back (radius)    RMB drag: tension    Wheel: segments    "
-    "MMB drag: orbit    LMB click / Alt+T / Enter: apply    Esc / RMB click: cancel"
+    "LMB drag: restore bevel    RMB drag: tension    Wheel: segments    "
+    "LMB / Enter: apply    Esc / RMB: cancel"
 )
 RADIUS_DRAG = 300.0   # px of horizontal drag per 100 % radius change
 COLLAPSE_SNAP = 0.04  # curve radius factor below which the drag stops at 0 (merge)
@@ -161,7 +159,9 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
         name="Whole Shape",
         description="Resample every loop connected to the selection through quad strips (side, bevels, "
                     "insets, inner wall) so the shape keeps all-quad topology. When off, only the selected "
-                    "loops change and are joined to their neighbours with quads and triangles",
+                    "loops change and are joined to their neighbours with quads and triangles. On open curves: "
+                    "when off, only the selected curves change, except across a bevel, which always changes "
+                    "as a whole",
         default=False,
     )
     radius_scale: FloatProperty(
@@ -186,8 +186,15 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
         description="Open curves: distribute the points evenly along the curve",
         default=False,
     )
+    tidy: BoolProperty(
+        name="Tidy",
+        description="Rebuild the strips that join the changed loops or curves to their neighbours with an "
+                    "even pattern: quads where the counts match (the loop turns to line up), and where they "
+                    "differ, the triangles spread evenly and symmetrically (R while resampling)",
+        default=False,
+    )
     select_similar: BoolProperty(
-        name="Same-Count Loops",
+        name="Select Similar",
         description="Also resample every other closed loop with the same vertex count in the objects "
                     "being edited (Space while resampling)",
         default=False,
@@ -215,6 +222,8 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             layout.prop(self, "delta")
         layout.prop(self, "fit_mode")
         layout.prop(self, "radius_scale")
+        if self.kind != KIND_RESTORE:
+            layout.prop(self, "tidy")
         if self.kind == KIND_CURVES:
             layout.prop(self, "profile_shift")
             layout.prop(self, "even_spacing")
@@ -253,15 +262,15 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
                 if not chains:
                     continue
                 core.resample(bm, chains, self._targets([c.n for c in chains]),
-                              force=force, scale=self.radius_scale)
+                              force=force, scale=self.radius_scale, tidy=self.tidy)
             else:
-                bands = curves.analyze(bm, self.fit_mode)
+                bands = curves.analyze(bm, self.fit_mode, whole=self.whole_shape)
                 if not bands:
                     continue
                 targets = self._targets([b.m for b in bands])
                 curves.resample(bm, bands, targets,
                                 even=self.even_spacing, shift=self.profile_shift, force=force,
-                                scale=self.radius_scale)
+                                scale=self.radius_scale, tidy=self.tidy)
                 if self.radius_scale == 0.0:
                     restore.remember(me, _collapse_records(bands, targets, self.profile_shift))
             bmesh.update_edit_mesh(me)
@@ -299,6 +308,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
         self.radius_scale = self._initial_radius
         self.profile_shift = 0.0
         self.even_spacing = False
+        self.tidy = False
         self.select_similar = False
         self._similar_added = None
         self._first_snaps = {}  # mesh pointer -> (mesh, snapshot) from before the first Space
@@ -342,6 +352,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             else:
                 bands = curves.analyze(bm)
                 st["curves"] = [b.m for b in bands]
+                st["curves_w"] = {False: [b.m for b in curves.analyze(bm, whole=False)], True: st["curves"]}
                 st["cache"] = {}
                 if not bands:
                     continue
@@ -391,6 +402,8 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
     def _orig(self, st):
         if self.kind == KIND_RINGS:
             return st["rings"][self.whole_shape]
+        if self.kind == KIND_CURVES:
+            return st["curves_w"][self.whole_shape]
         return st["curves"]  # curves, or the segment counts of remembered collapses
 
     @property
@@ -448,7 +461,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             if self.kind == KIND_RESTORE:
                 restore.expand(bm, st["matches"], self.radius_scale, targets, self.profile_shift)
             elif self.kind == KIND_RINGS:
-                if force or self.radius_scale != 1.0 or targets != orig:
+                if force or self.radius_scale != 1.0 or targets != orig or self.tidy:
                     chains = core.analyze(bm, self.fit_mode, whole=self.whole_shape)
                     if self.fit_mode == core.FIT_CIRCLE:
                         for chain in chains:
@@ -456,15 +469,16 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
                                 checked += 1
                                 bad += not core.ring_is_perfect(ring)
                     if [c.n for c in chains] == orig:
-                        core.resample(bm, chains, targets, force=force, scale=self.radius_scale)
+                        core.resample(bm, chains, targets, force=force, scale=self.radius_scale,
+                                      tidy=self.tidy)
             else:
                 if (force or self.even_spacing or self.profile_shift or self.radius_scale != 1.0
-                        or targets != orig):
-                    bands = curves.analyze(bm, self.fit_mode, cache=st["cache"])
+                        or targets != orig or self.tidy):
+                    bands = curves.analyze(bm, self.fit_mode, cache=st["cache"], whole=self.whole_shape)
                     if [b.m for b in bands] == orig:
                         curves.resample(bm, bands, targets, even=self.even_spacing,
                                         shift=self.profile_shift, force=force,
-                                        scale=self.radius_scale)
+                                        scale=self.radius_scale, tidy=self.tidy)
                         st["collapsed"] = (_collapse_records(bands, targets, self.profile_shift)
                                            if self.radius_scale == 0.0 else None)
             bmesh.update_edit_mesh(me)
@@ -488,24 +502,29 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
                 info += f"  [typing {self._typed}]"
             if self.kind == KIND_RINGS:
                 if self._fixed is not None:
-                    info += f"  |  Fixed {self._fixed[0]} of {self._fixed[1]} loops to perfect circles"
+                    info += f"  |  Perfect circle: {self._fixed[0]} of {self._fixed[1]} fixed"
                 if self.radius_scale != 1.0:
                     info += f"  |  Radius ×{self.radius_scale:.3f}"
-                scope = "Whole shape" if self.whole_shape else "Selected loops"
+                scope = "Whole" if self.whole_shape else "Selected"
+                if self.tidy:
+                    scope += "  |  Tidy"
                 text = f"Roundabout  |  {info}  |  {scope}  |  Fit: {FIT_LABELS[self.fit_mode]}"
             elif self.kind == KIND_RESTORE:
                 p = self._shown_profile()
-                rad = ("collapsed: drag LMB right to bring the bevel back" if self.radius_scale == 0.0
-                       else f"Radius ×{self.radius_scale:.3f} of the original bevel")
-                text = f"Roundabout (restore bevel)  |  {info}  |  {rad}  |  Tension {p:.2f}"
+                rad = ("Collapsed: LMB drag right" if self.radius_scale == 0.0
+                       else f"Radius ×{self.radius_scale:.3f}")
+                text = f"Roundabout (restore)  |  {info}  |  {rad}  |  Tension {p:.2f}"
             else:
                 p = self._shown_profile()
-                prof = f"Tension (profile) {p:.2f}" if p is not None else "Tension n/a"
+                prof = f"Tension {p:.2f}" if p is not None else "Tension n/a"
                 spacing = "Even spacing" if self.even_spacing else "Original spacing"
                 rad = f"  |  Radius ×{self.radius_scale:.3f}" if self.radius_scale != 1.0 else ""
                 if self.radius_scale == 0.0:
-                    rad = "  |  Radius 0: merge to a point (removes the bevel)"
-                text = (f"Roundabout (curve)  |  {info}{rad}  |  {prof}  |  {spacing}  |  "
+                    rad = "  |  Radius 0: removes the bevel"
+                scope = "Whole" if self.whole_shape else "Selected"
+                if self.tidy:
+                    scope += "  |  Tidy"
+                text = (f"Roundabout (curve)  |  {info}{rad}  |  {prof}  |  {spacing}  |  {scope}  |  "
                         f"Fit: {CURVE_FIT_LABELS[self.fit_mode]}")
             context.area.header_text_set(text)
             context.area.tag_redraw()
@@ -758,8 +777,15 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             self._add_similar(context)
             return {'RUNNING_MODAL'}
 
-        if t == 'W' and self.kind == KIND_RINGS:
-            if any(st["rings"][not self.whole_shape] for st in self._states):
+        if t == 'R' and self.kind != KIND_RESTORE:
+            self.tidy = not self.tidy
+            self._typed = ""
+            self._apply(context)
+            return {'RUNNING_MODAL'}
+
+        if t == 'W' and self.kind != KIND_RESTORE:
+            key = "rings" if self.kind == KIND_RINGS else "curves_w"
+            if any(st[key][not self.whole_shape] for st in self._states):
                 self.whole_shape = not self.whole_shape
                 # Remembered: the next Alt+T starts in this mode, until W is
                 # pressed again (also stored in the add-on preferences).
@@ -813,49 +839,52 @@ def _draw_hud(op):
             blf.draw(font, text)
             px += blf.dimensions(font, text)[0]
 
-    label = "segments" if rings else "bevel segments" if restoring else "curve segments"
+    label = "segments"
     parts(x + w + 8 * ui, y + 10 * ui,
           [(label + (f"  ({op._typed}_)" if op._typed else ""), TEXT), ("   Wheel", KEY)])
     if restoring:
-        line = [("restore collapsed bevel", TEXT)]
+        line = [("restore bevel", TEXT)]
     elif rings:
-        line = [(f"fit: {FIT_LABELS[op.fit_mode].lower()}", TEXT), ("  F", KEY), ("   |   ", TEXT),
-                ("whole shape" if op.whole_shape else "selected loops", TEXT), ("  W", KEY)]
+        line = [(f"fit {FIT_LABELS[op.fit_mode].lower()}", TEXT), ("  F", KEY), ("   |   ", TEXT),
+                ("whole" if op.whole_shape else "selected", TEXT), ("  W", KEY)]
     else:
-        line = [(f"fit: {CURVE_FIT_LABELS[op.fit_mode].lower()}", TEXT), ("  F", KEY), ("   |   ", TEXT),
-                ("even spacing" if op.even_spacing else "original spacing", TEXT), ("  MMB click", KEY)]
+        line = [(f"fit {CURVE_FIT_LABELS[op.fit_mode].lower()}", TEXT), ("  F", KEY), ("   |   ", TEXT),
+                ("even spacing" if op.even_spacing else "original spacing", TEXT), ("  MMB", KEY),
+                ("   |   ", TEXT), ("whole" if op.whole_shape else "selected", TEXT), ("  W", KEY)]
     parts(x + w + 8 * ui, y - 4 * ui, line)
 
     rows = []
     if not op._uniform and not op.use_absolute:
-        rows.append([("counts differ: match them", TEXT), ("   E highest · D lowest", KEY)])
+        rows.append([("match counts", TEXT), ("   E max · D min", KEY)])
     press = op._press or {}
     dragging = press.get("drag")
     if not op._has_radius:
-        rows.append([("radius: n/a (straight edge, no bevel or arc)", TEXT)])
+        rows.append([("radius n/a", TEXT)])
     elif op.radius_scale == 0.0 and not rings:
         if restoring:
-            rows.append([("collapsed", WARN), ("   LMB drag right to bring it back", KEY)])
+            rows.append([("collapsed", WARN), ("   LMB drag right", KEY)])
         else:
-            rows.append([("radius 0: merges each curve into a point (removes the bevel)", WARN),
-                         ("   LMB drag right to undo", KEY)])
+            rows.append([("radius 0: removes the bevel", WARN), ("   LMB drag right", KEY)])
     else:
-        suffix = " of the original" if restoring else ""
-        rows.append([(f"radius ×{op.radius_scale:.3f}{suffix}", VALUE), ("   LMB drag", KEY)])
+        rows.append([(f"radius ×{op.radius_scale:.3f}", VALUE), ("   LMB drag", KEY)])
+    if not restoring:
+        if op.tidy:
+            rows.append([("tidy: on", GOOD), ("   R", KEY)])
+        else:
+            rows.append([("tidy", TEXT), ("   R", KEY)])
     if rings:
         if op._fixed is not None:
-            rows.append([(f"loops fixed: {op._fixed[0]} of {op._fixed[1]} were not perfect circles", GOOD),
-                         ("   MMB click to undo", KEY)])
+            rows.append([(f"perfect circle: {op._fixed[0]} of {op._fixed[1]} fixed", GOOD), ("   MMB undo", KEY)])
         else:
-            rows.append([("fix loops to perfect circles", TEXT), ("   MMB click", KEY)])
+            rows.append([("perfect circle", TEXT), ("   MMB", KEY)])
         if op._similar_added is None:
-            rows.append([("add loops with the same count", TEXT), ("   Space", KEY)])
+            rows.append([("select similar", TEXT), ("   Space", KEY)])
         else:
-            rows.append([(f"added {op._similar_added} loops with the same count", GOOD), ("   Space", KEY)])
+            rows.append([(f"select similar: +{op._similar_added}", GOOD), ("   Space", KEY)])
     else:
         p = op._shown_profile()
         if p is None:
-            rows.append([("tension: n/a (straight curve)", TEXT)])
+            rows.append([("tension n/a", TEXT)])
         else:
             hint = "   0.25 flat · 0.5 round · 1 sharp" if dragging and press.get("button") == 'RIGHT' else ""
             rows.append([(f"tension {p:.2f}", VALUE), ("   RMB drag" + hint, KEY)])

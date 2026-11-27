@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Shorter labels on screen: perfect circle, select similar, tidy, selected / whole, match max / min.
+- New: **R** tidies the connections while resampling, on loops and curves. The strips joining the changed loops or curves to their neighbours are rebuilt with an even pattern: quads where the counts match (the loop turns to line up), and where they differ, the triangles are spread evenly (mirrored about the middle on curves). Tidy also straightens a twisted quad strip between loops, so each edge across it takes the shortest way, and it works at the current count too (press R without changing the count). Also in the Adjust Last Operation panel.
+- Open curves follow the W switch too. In selected mode only the picked curves change, not every parallel curve connected through quads (such as the arcs down the whole side of a shape); triangles join them to their neighbours, and going back to the neighbour's count gives clean quads again. A bevel or chamfer profile still changes all the way along the bevel.
+- A quad beside a curve that gained points is split into triangles instead of becoming one long n-gon.
+- Selected loops joined by a zig-zag of triangles (loops that don't line up) are lined up when they get the same count, and the strip between them becomes clean quads. With different counts it is rebuilt as one clean zig-zag, so lowering the count and raising it again no longer leaves a mess.
+
 ## 1.0.1
 
 - Radius works on a chamfer looped around a shape with sharp corners; the corner (miter) edges no longer turn it off for the whole loop, and they scale in step with the rest.

@@ -1525,6 +1525,207 @@ def chamfer_loop_radius_with_twisted_columns():
     expect(not check_topology(bm), check_topology(bm))
 
 
+def make_tube_rim(n_out=16, n_in=16, twist=0.5):
+    """Tube top: outer and inner rim loops joined by a zig-zag of triangles
+    (the inner loop turned by ``twist`` of a step), each with a wall down."""
+    bm = bmesh.new()
+    def ring(n, r, z, off):
+        return [bm.verts.new((r * math.cos(TAU * (k + off) / n), r * math.sin(TAU * (k + off) / n), z)) for k in range(n)]
+    O, I = ring(n_out, 1.0, 1.0, 0.0), ring(n_in, 0.8, 1.0, twist)
+    Ob, Ib = ring(n_out, 1.0, 0.0, 0.0), ring(n_in, 0.8, 0.0, twist)
+    for R, Rb in ((O, Ob), (I, Ib)):
+        n = len(R)
+        for k in range(n):
+            bm.faces.new((R[k], R[(k + 1) % n], Rb[(k + 1) % n], Rb[k]))
+    # zig-zag between O and I by angle
+    ang = lambda v: math.atan2(v.co.y, v.co.x) % TAU  # noqa: E731
+    i = j = 0
+    io, ii = sorted(range(n_out), key=lambda k: ang(O[k])), sorted(range(n_in), key=lambda k: ang(I[k]))
+    while i < n_out or j < n_in:
+        a0, a1 = O[io[i % n_out]], O[io[(i + 1) % n_out]]
+        b0, b1 = I[ii[j % n_in]], I[ii[(j + 1) % n_in]]
+        ta = ang(a1) + (TAU if i + 1 >= n_out else 0.0)
+        tb = ang(b1) + (TAU if j + 1 >= n_in else 0.0) + (TAU if ang(b1) < ang(I[ii[0]]) else 0.0)
+        if j >= n_in or (i < n_out and ta <= tb):
+            bm.faces.new((a0, a1, b0))
+            i += 1
+        else:
+            bm.faces.new((a0, b1, b0))
+            j += 1
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    ob = new_object_from_bm(bm, "Tube")
+    bm = edit(ob)
+    select_edges(bm, lambda e: all(abs(v.co.z - 1.0) < 1e-6 for v in e.verts)
+                 and abs(e.verts[0].co.xy.length - e.verts[1].co.xy.length) < 1e-6)
+    bmesh.update_edit_mesh(ob.data)
+    return ob
+
+
+def rim_faces(bm):
+    return [f for f in bm.faces if all(abs(v.co.z - 1.0) < 1e-6 for v in f.verts)]
+
+
+@test
+def selected_loops_zigzag_rim_becomes_quads():
+    # Two selected loops joined by a zig-zag strip (they don't line up). With
+    # the same new count, the strip is rebuilt as clean, radial quads; with
+    # different counts it stays a clean zig-zag, and matching again cleans it.
+    ob = make_tube_rim()
+    for segs in (6, 4, 16, 23):
+        expect(run_op(use_absolute=True, segments=segs, whole_shape=False) == {'FINISHED'}, "op failed")
+        bm = bmesh.from_edit_mesh(ob.data)
+        rim = rim_faces(bm)
+        expect(len(rim) == segs and all(len(f.verts) == 4 for f in rim),
+               f"{segs}: rim faces {sorted(len(f.verts) for f in rim)} (expected {segs} quads)")
+        worst = 0.0
+        for f in rim:
+            for e in f.edges:
+                a, b = e.verts
+                if abs(a.co.xy.length - b.co.xy.length) > 0.1:
+                    worst = max(worst, abs(a.co.xy.angle_signed(b.co.xy)))
+        expect(worst < 1e-4, f"{segs}: rim edges not radial (off by {math.degrees(worst):.2f} deg)")
+        expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+
+    reset()
+    ob = make_tube_rim(16, 12, twist=0.3)
+    run_op(delta=4, whole_shape=False)
+    bm = bmesh.from_edit_mesh(ob.data)
+    rim = rim_faces(bm)
+    expect(sorted({len(f.verts) for f in rim}) in ([3], [3, 4]), f"different counts: rim face sizes {sorted(len(f.verts) for f in rim)}")
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+    run_op(use_absolute=True, segments=20, whole_shape=False)
+    bm = bmesh.from_edit_mesh(ob.data)
+    rim = rim_faces(bm)
+    expect(len(rim) == 20 and all(len(f.verts) == 4 for f in rim), f"matched again: rim {sorted(len(f.verts) for f in rim)}")
+
+
+@test
+def tidy_pattern_is_even_and_symmetric():
+    for na, nb in ((11, 8), (8, 11), (13, 17), (20, 16), (7, 2), (9, 9), (30, 5)):
+        for closed in (False, True):
+            k = core.tidy_pattern(na, nb, closed)
+            expect(k.count('Q') + k.count('A') == na and k.count('Q') + k.count('B') == nb,
+                   f"{na}/{nb} closed={closed}: {''.join(k)} does not use every segment once")
+            T, d = max(na, nb), abs(na - nb)
+            rare = min(d, T - d)
+            if not closed and not (T % 2 == 0 and rare % 2 == 1):  # (no middle step to put the odd one on)
+                expect(k == k[::-1], f"{na}/{nb}: open pattern {''.join(k)} is not mirrored")
+            tris = [i for i, x in enumerate(k) if x != 'Q']
+            if len(tris) > 1:
+                gaps = [b - a for a, b in zip(tris, tris[1:])]
+                if closed:
+                    gaps.append(tris[0] + len(k) - tris[-1])
+                expect(max(gaps) - min(gaps) <= 1 or not closed and len(set(gaps)) <= 2,
+                       f"{na}/{nb} closed={closed}: uneven pattern {''.join(k)}")
+
+
+@test
+def tidy_untwists_quad_strip_between_selected_loops():
+    # Outer and inner rim loops joined by clean quads that are twisted (each
+    # rung leans 40 % of a step). Without tidy the twist is kept; with tidy
+    # the loops turn to line up and every rung takes the shortest way.
+    def build():
+        reset()
+        bm = bmesh.new()
+        n = 16
+        def ring(r, z, off):
+            return [bm.verts.new((r * math.cos(TAU * (k + off) / n), r * math.sin(TAU * (k + off) / n), z))
+                    for k in range(n)]
+        O, I = ring(1.0, 1.0, 0.0), ring(0.8, 1.0, 0.4)
+        Ob, Ib = ring(1.0, 0.0, 0.0), ring(0.8, 0.0, 0.4)
+        for A, B in ((O, Ob), (I, Ib), (O, I)):
+            for k in range(n):
+                bm.faces.new((A[k], A[(k + 1) % n], B[(k + 1) % n], B[k]))
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+        ob = new_object_from_bm(bm, "Twisted")
+        bm = edit(ob)
+        select_edges(bm, lambda e: all(abs(v.co.z - 1.0) < 1e-6 for v in e.verts)
+                     and abs(e.verts[0].co.xy.length - e.verts[1].co.xy.length) < 1e-6)
+        bmesh.update_edit_mesh(ob.data)
+        return ob
+
+    def twist(bm):
+        worst = 0.0
+        for f in rim_faces(bm):
+            for e in f.edges:
+                a, b = e.verts
+                if abs(a.co.xy.length - b.co.xy.length) > 0.1:
+                    worst = max(worst, abs(a.co.xy.angle_signed(b.co.xy)))
+        return math.degrees(worst)
+
+    ob = build()
+    run_op(delta=2, whole_shape=False)
+    expect(twist(bmesh.from_edit_mesh(ob.data)) > 5.0, "without tidy the twisted strip should stay twisted")
+    for kw in (dict(delta=0), dict(delta=2), dict(delta=-6)):
+        ob = build()
+        run_op(whole_shape=False, tidy=True, **kw)
+        bm = bmesh.from_edit_mesh(ob.data)
+        rim = rim_faces(bm)
+        expect(all(len(f.verts) == 4 for f in rim) and twist(bm) < 1e-3,
+               f"{kw}: rim {sorted(len(f.verts) for f in rim)}, rungs off radial by {twist(bm):.2f} deg")
+        expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+
+
+@test
+def curve_tidy_spreads_triangles_symmetrically():
+    # One arc of a stacked cylinder, 8 -> 11 segments in selected mode with
+    # tidy connections: each side strip gets 3 triangles, evenly spread and
+    # mirrored about the middle (not clumps of triangles).
+    ob = make_stacked_cylinder(n=16, uvs=False)
+    bm = edit(ob)
+    top = sorted((v for v in bm.verts if abs(v.co.z) < 1e-5), key=lambda v: math.atan2(v.co.y, v.co.x) % TAU)[:9]
+    chosen = set(top)
+    select_edges(bm, lambda e: all(v in chosen for v in e.verts))
+    bmesh.update_edit_mesh(ob.data)
+    run_op(delta=3, whole_shape=False, tidy=True)
+    bm = bmesh.from_edit_mesh(ob.data)
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+    for z0, z1 in ((0.0, 0.5), (-0.5, 0.0)):
+        fs = [f for f in bm.faces if all(z0 - 1e-5 <= v.co.z <= z1 + 1e-5 for v in f.verts)
+              and len({round(v.co.z, 4) for v in f.verts}) == 2]
+        fs = [f for f in fs if 0.0 < math.atan2(f.calc_center_median().y, f.calc_center_median().x) < math.pi]
+        fs.sort(key=lambda f: math.atan2(f.calc_center_median().y, f.calc_center_median().x))
+        pat = "".join("Q" if len(f.verts) == 4 else "T" for f in fs)
+        expect(pat == "QTQQQTQQQTQ", f"strip {z0}..{z1}: {pat} (expected QTQQQTQQQTQ)")
+
+
+@test
+def curve_selected_only_changes_just_that_curve():
+    # Half of the top loop of a stacked cylinder: the parallel arcs below
+    # form one band with it, but in selected mode only the picked arc
+    # changes; triangles join it to the arc below. Going back to the original
+    # count gives clean quads again. A bevel still changes as a whole.
+    ob = make_stacked_cylinder(n=16, uvs=False)
+    top = max(ZS)
+    bm = edit(ob)
+    sel = sorted((v for v in bm.verts if abs(v.co.z - top) < 1e-5), key=lambda v: math.atan2(v.co.y, v.co.x) % TAU)[:9]
+    chosen = set(sel)
+    select_edges(bm, lambda e: all(v in chosen for v in e.verts))
+    bmesh.update_edit_mesh(ob.data)
+    n_faces = len(bm.faces)
+    expect(run_op(delta=4, whole_shape=False) == {'FINISHED'}, "op failed")
+    bm = bmesh.from_edit_mesh(ob.data)
+    got = ring_counts(bm)
+    expect(got == [16, 16, 16, 16, 20],
+           f"ring counts {got} (only the top ring should gain the 4 points)")
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+    expect(run_op(delta=-4, whole_shape=False) == {'FINISHED'}, "op failed")
+    bm = bmesh.from_edit_mesh(ob.data)
+    sizes = {len(f.verts) for f in bm.faces if max(v.co.z for v in f.verts) - min(v.co.z for v in f.verts) > 1e-5}
+    expect(ring_counts(bm) == [16] * 5 and len(bm.faces) == n_faces and sizes == {4},
+           f"back to 16: {ring_counts(bm)}, {len(bm.faces)} faces (was {n_faces}), side face sizes {sizes}")
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+
+    reset()
+    ob = make_profile_cylinder([(1.0, -1.0)] + arc())
+    bm = edit(ob)
+    select_column(bm, 0.7)
+    bmesh.update_edit_mesh(ob.data)
+    run_op(delta=2, whole_shape=False)
+    bm = bmesh.from_edit_mesh(ob.data)
+    expect(len(bm.verts) == 16 * 7, f"verts {len(bm.verts)}: a bevel should still change all the way around")
+
+
 @test
 def curves_across_zigzag_strip_become_one_band():
     # Parallel arches with the same segment count, where the strip between

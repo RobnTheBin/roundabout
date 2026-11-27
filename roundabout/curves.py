@@ -36,7 +36,7 @@ from mathutils import Vector
 
 from .core import (
     FIT_AUTO, FIT_CIRCLE, FIT_SPLINE,
-    _Jobs, _face_goes, _get_edge, _round_half_up, _shares_small_face, edge_between,
+    _Jobs, _face_goes, _get_edge, _round_half_up, _shares_small_face, edge_between, tidy_pattern,
 )
 
 MIN_SEGMENTS = 1
@@ -173,12 +173,13 @@ def _fan_faces(v, f, e_from, e_to, limit=64):
     return None
 
 
-def _zip_column(col, edges, f):
+def _zip_column(col, edges, f, same_count=True):
     """The column next to ``col`` across a strip that is not a clean quad
     strip but a zig-zag of quads and triangles (what an earlier resample of
     two separately resampled bands leaves between them). The next column must
-    have the same number of segments and be joined to ``col`` by one edge at
-    each end. Returns (verts, row faces, all strip faces) or None."""
+    be joined to ``col`` by one edge at each end and (with ``same_count``)
+    have the same number of segments. Returns (verts, row faces, all strip
+    faces) or None."""
     m = len(edges)
     fwd = _face_goes(f, col[0], col[1])
     row = []
@@ -214,21 +215,22 @@ def _zip_column(col, edges, f):
         path.append(cur)
         if cur == col[m]:
             break
-        if cur in cset or len(adj.get(cur, ())) != 2 or len(path) > m + 3:
+        if cur in cset or len(adj.get(cur, ())) != 2 or len(path) > (m + 3 if same_count else 4 * m + 8):
             return None
         e = adj[cur][0] if adj[cur][1] == e else adj[cur][1]
     nxt = path[1:-1]
-    if len(nxt) != m + 1 or len(set(nxt)) != m + 1:
+    if len(nxt) < 2 or len(set(nxt)) != len(nxt) or (same_count and len(nxt) != m + 1):
         return None
     nset = set(nxt)
     # Every face spans both columns, and none spans most of either (that
     # would be a cap n-gon, not a strip).
-    most = max(1, m // 2)
+    most_c = max(1, m // 2)
+    most_n = max(1, (len(nxt) - 1) // 2)
     for x in region:
         vs = set(x.verts)
         if not vs <= (cset | nset) or not (vs & cset) or not (vs & nset):
             return None
-        if len(vs & cset) > most + 1 or len(vs & nset) > most + 1:
+        if len(vs & cset) > most_c + 1 or len(vs & nset) > most_n + 1:
             return None
     return nxt, row, region
 
@@ -239,6 +241,8 @@ class Band:
         self.col_edges = []  # col_edges[c][i]: edge between rows i and i + 1
         self.strips = []     # strips[c][i]: face between columns c, c + 1 and rows i, i + 1
         self.extra = set()   # other faces of zig-zag strips (rebuilt as quads too)
+        self.regions = []    # regions[c]: every face of strip c (row faces and extra)
+        self.sides = []      # (end, column, row faces, faces): unchanged neighbours at open ends
         self.closed = False
         self.m = 0
         self.curves = []
@@ -296,6 +300,7 @@ def build_band(path):
                 return
             if forward and nxt == col0:
                 band.strips.append(faces)
+                band.regions.append(region)
                 band.extra |= region - set(faces)
                 used_faces.update(region)
                 band.closed = True
@@ -312,10 +317,12 @@ def build_band(path):
                 band.columns.append(nxt)
                 band.col_edges.append(nedges)
                 band.strips.append(faces)
+                band.regions.append(region)
             else:
                 band.columns.insert(0, nxt)
                 band.col_edges.insert(0, nedges)
                 band.strips.insert(0, faces)
+                band.regions.insert(0, region)
                 band.sel += 1
             others = [x for x in nedges[0].link_faces if x not in region]
             f = others[0] if len(others) == 1 else None
@@ -991,9 +998,84 @@ def _fit_band(band, fit_mode, cache=None):
     band.profile = float(np.median(profiles)) if profiles else None
 
 
-def analyze(bm, fit_mode=FIT_AUTO, cache=None):
+def _sub_band(band, run):
+    """The part of a band made of the columns at indices ``run`` (in order)."""
+    K = len(band.columns)
+    sub = Band()
+    sub.m = band.m
+    sub.columns = [band.columns[i] for i in run]
+    sub.col_edges = [band.col_edges[i] for i in run]
+    sub.strips = [band.strips[i] for i in run[:-1]]
+    sub.regions = [band.regions[i] for i in run[:-1]]
+    for strip, region in zip(sub.strips, sub.regions):
+        sub.extra |= region - set(strip)
+    sub.sel = run.index(band.sel) if band.sel in run else 0
+    return sub
+
+
+def _selected_runs(band):
+    """Runs of consecutive selected columns (indices in band order)."""
+    K = len(band.columns)
+    sel = [all(e.select for e in ce) for ce in band.col_edges]
+    if all(sel):
+        return [list(range(K))]
+    start = next(i for i in range(K) if not sel[i]) if band.closed else 0
+    runs, cur = [], []
+    for t in range(K):
+        i = (start + t) % K
+        if sel[i]:
+            cur.append(i)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _find_sides(band, taken_f, taken_v):
+    """The unchanged neighbour column beyond each open end of the band, when
+    the strip to it is a quad strip or a zig-zag. If the band is resampled to
+    that column's count, the strip is rebuilt as clean quads."""
+    band.sides = []
+    if band.closed:
+        return
+    K = len(band.columns)
+    ends = []
+    for end, c in (('start', 0), ('end', K - 1)):
+        inside = set()
+        if K > 1:
+            inside = band.regions[0] if end == 'start' else band.regions[-1]
+        out = [f for f in band.col_edges[c][0].link_faces if f not in inside]
+        if K == 1:
+            out = out[:1] if end == 'start' else out[1:2]
+        if len(out) == 1:
+            ends.append((end, c, out[0]))
+    for end, c, f in ends:
+        col, edges = band.columns[c], band.col_edges[c]
+        res = _next_column(col, edges, f)
+        if res is not None:
+            ncol, rows = res
+            region = set(rows)
+        else:
+            res = _zip_column(col, edges, f, same_count=False)
+            if res is None:
+                continue
+            ncol, rows, region = res
+        if region & taken_f or any(v in taken_v for v in ncol):
+            continue
+        taken_f |= region
+        band.sides.append((end, ncol, rows, region))
+
+
+def analyze(bm, fit_mode=FIT_AUTO, cache=None, whole=True):
     """Bands for every open path in the selection (one band per quad band;
     several selected columns of the same band count once).
+
+    ``whole``: every column of the band is resampled. Otherwise only the
+    selected columns are (the rest of the band stays as it is and is joined
+    with triangles), except on a bevel or chamfer, whose profile columns
+    always change together.
 
     ``cache``: a dict kept between calls on identical geometry (the modal
     tool restores the same snapshot on every step); the curve fits are
@@ -1023,6 +1105,26 @@ def analyze(bm, fit_mode=FIT_AUTO, cache=None):
         bm.verts.index_update()
     for band in bands:
         _fit_band(band, fit_mode, cache)
+    if not whole:
+        kept = []
+        for band in bands:
+            runs = _selected_runs(band)
+            if (len(runs) == 1 and len(runs[0]) == len(band.columns)) or all(cv.legs for cv in band.curves):
+                kept.append(band)
+                continue
+            for run in runs:
+                sub = _sub_band(band, run)
+                _fit_band(sub, fit_mode, cache)
+                kept.append(sub)
+        bands = kept
+    taken_f = set()
+    taken_v = set()
+    for band in bands:
+        taken_f |= band.faces()
+        for col in band.columns:
+            taken_v.update(col)
+    for band in bands:
+        _find_sides(band, taken_f, taken_v)
     return bands
 
 
@@ -1066,7 +1168,7 @@ def _restitch(bm, F, lookup, bands, jobs):
         return None
 
     order = [(start + t) % L for t in range(L)]
-    out, prov = [], []
+    out, prov, grp = [], [], []
     t = 0
     while t < L:
         p = order[t]
@@ -1086,6 +1188,7 @@ def _restitch(bm, F, lookup, bands, jobs):
             else:
                 out.append(verts[p])
             prov.append(p)
+            grp.append(None)
             continue
         b, c, d = key
         band = bands[b]
@@ -1096,6 +1199,7 @@ def _restitch(bm, F, lookup, bands, jobs):
         ks_list = list(range(ks, ke + step, step))
         for n, k in enumerate(ks_list):
             out.append(band.W[c][k])
+            grp.append(t)
             if n == 0:
                 prov.append(run[0])
             elif n == len(ks_list) - 1:
@@ -1105,21 +1209,31 @@ def _restitch(bm, F, lookup, bands, jobs):
         if len(ks_list) == 1:
             prov[-1] = None
 
-    vs, pv = [], []
-    for v, p in zip(out, prov):
+    vs, pv, gs = [], [], []
+    for v, p, g in zip(out, prov, grp):
         if vs and vs[-1] == v:
             pv[-1] = None
             continue
         vs.append(v)
         pv.append(p)
+        gs.append(g)
     while len(vs) > 1 and vs[0] == vs[-1]:
         vs.pop()
         pv.pop()
+        gs.pop()
         pv[0] = None
     if len(vs) < 3 or len(set(vs)) != len(vs):
         return None
 
-    f = jobs.face(bm, vs, F)
+    pieces = _zigzag(vs, gs) if len(vs) > 4 and L <= 4 else None
+    if pieces:
+        # A quad or triangle beside a resampled column with more points:
+        # triangles across the strip instead of one long n-gon.
+        f = None
+        for piece in pieces:
+            f = jobs.face(bm, piece, F) or f
+    else:
+        f = jobs.face(bm, vs, F)
     if f is None:
         return None
     n = len(vs)
@@ -1129,6 +1243,42 @@ def _restitch(bm, F, lookup, bands, jobs):
             continue
         jobs.edge(bm.edges.get((vs[i], vs[(i + 1) % n])), loops[pa].edge)
     return f
+
+
+def _zigzag(vs, gs):
+    """Split a polygon into triangles across it: one side is the longest run
+    of new column vertices (group in ``gs``), the other side the rest. Each
+    step joins whichever pair of vertices across the gap is closer."""
+    n = len(vs)
+    counts = {}
+    for g in gs:
+        if g is not None:
+            counts[g] = counts.get(g, 0) + 1
+    if not counts:
+        return None
+    g = max(counts, key=counts.get)
+    k = counts[g]
+    if k < 3 or n - k < 1:
+        return None
+    # Rotate so the run starts at index 0 (it must be contiguous).
+    starts = [i for i in range(n) if gs[i] == g and gs[i - 1] != g]
+    if len(starts) != 1:
+        return None
+    r = starts[0]
+    vs = vs[r:] + vs[:r]
+    a = vs[:k]
+    b = vs[k:][::-1]  # from the vertex next to a[0] to the one next to a[-1]
+    faces = []
+    i = j = 0
+    while i < len(a) - 1 or j < len(b) - 1:
+        if j >= len(b) - 1 or (i < len(a) - 1 and
+                               (a[i + 1].co - b[j].co).length <= (a[i].co - b[j + 1].co).length):
+            faces.append([a[i], a[i + 1], b[j]])
+            i += 1
+        else:
+            faces.append([a[i], b[j + 1], b[j]])
+            j += 1
+    return faces
 
 
 def _rebuild_band(bm, bid, band, M, pts, jobs, lookup):
@@ -1192,6 +1342,38 @@ def _rebuild_band(bm, bid, band, M, pts, jobs, lookup):
                         jobs.edge(e, src, seam=False, smooth=True)
 
 
+def _rebuild_sides(bm, band, M, jobs, tidy=False):
+    """Rebuild the strip between the band's end column and an unchanged
+    neighbour: quads when the neighbour has M segments (back to its count:
+    a zig-zag becomes clean); with ``tidy`` also for other counts, as an
+    even pattern mirrored about the middle."""
+    done = set()
+    m = band.m
+    for end, ncol, rows, region in band.sides:
+        k_n = len(ncol) - 1
+        if k_n != M and not tidy:
+            continue
+        c = 0 if end == 'start' else len(band.columns) - 1
+        col, A = band.columns[c], band.W[c]
+        goes = _face_goes(rows[0], col[0], col[1])
+        i = j = 0
+        for kind in tidy_pattern(M, k_n, closed=False):
+            src = rows[min(m - 1, int((min(i, M - 1) + 0.5) * m / M))]
+            if kind == 'Q':
+                vs = [A[i], A[i + 1], ncol[j + 1], ncol[j]]
+            elif kind == 'A':
+                vs = [A[i], A[i + 1], ncol[j]]
+            else:
+                vs = [A[i], ncol[j + 1], ncol[j]]
+            jobs.face(bm, vs if goes else list(reversed(vs)), src)
+            if kind in ('Q', 'A'):
+                i += 1
+            if kind in ('Q', 'B'):
+                j += 1
+        done |= region
+    return done
+
+
 def _column_scales(band, scale):
     if scale == 1.0 or not band.has_radius():
         return [1.0] * len(band.curves)
@@ -1237,7 +1419,7 @@ def collapse(bm, bands):
     return len(bands)
 
 
-def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0):
+def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0, tidy=False):
     """Resample ``bands`` (from ``analyze`` on this bm) to ``counts`` segments.
     ``even``: evenly spaced points; ``shift``: profile change (tension);
     ``scale``: radius factor of the selected curve. The other columns of its
@@ -1257,14 +1439,15 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0):
         if M is None:
             continue
         M = max(MIN_SEGMENTS, min(MAX_SEGMENTS, int(M)))
-        if M == band.m and not (even or shift or force or scale != 1.0):
+        if M == band.m and not (even or shift or force or scale != 1.0 or (tidy and band.sides)):
             continue
         pts = [cv.new_points(M, even, shift, k) for cv, k in zip(band.curves, _column_scales(band, scale))]
         if scale != 1.0:
             for col, P in zip(band.columns, pts):
                 col[0].co = Vector(P[0].tolist())
                 col[-1].co = Vector(P[-1].tolist())
-        if M == band.m and not band.extra:
+        zig_side = any((len(ncol) - 1 == M or tidy) and region != set(rows) for _, ncol, rows, region in band.sides)
+        if M == band.m and not band.extra and not zig_side:
             # Same count: only move the vertices (a zig-zag strip is rebuilt).
             for col, P in zip(band.columns, pts):
                 for i in range(1, M):
@@ -1289,6 +1472,7 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0):
         live.append(band)
         _rebuild_band(bm, bid, band, M, pts, jobs, lookup)
         handled |= band.faces()
+        handled |= _rebuild_sides(bm, band, M, jobs, tidy)
         for col in band.columns:
             old_inner.extend(col[1:-1])
         for ce in band.col_edges:

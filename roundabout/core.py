@@ -514,6 +514,9 @@ class Chain:
         self.closed = False
         self.caps = []        # list of ('NGON', ring, face) / ('FAN', ring, apex, tris)
         self.zips = []        # ZipBand: quad/tri strips to untouched neighbour loops
+        # PairZip: zig-zag strips from a ring of this chain to a ring of another
+        # resampled chain (two selected loops that don't line up).
+        self.pairs = []
         self.n = 0
         self.mode = FIT_SPLINE
 
@@ -655,10 +658,15 @@ def analyze(bm, fit_mode=FIT_AUTO, whole=False):
         for ring in chain.rings:
             ring.set_mode(mode)
     forbidden = set()
+    owners = {}
     for chain in chains:
         forbidden |= chain.all_verts()
+        for ring in chain.rings:
+            for v in ring.verts:
+                owners[v] = (ring, chain)
+    pairs_seen = set()
     for chain in chains:
-        chain.zips = _find_zip_bands(chain, forbidden)
+        chain.zips = _find_zip_bands(chain, forbidden, owners, pairs_seen)
     return chains
 
 
@@ -676,6 +684,19 @@ class ZipBand:
         self.L = L            # neighbour loop, sorted by ring parameter
         self.pL = pL          # ring parameter of every neighbour vertex
         self.forward = forward  # old faces run along the ring in increasing parameter
+        self.old_params = dict(zip(L, pL))  # ring parameter of the old faces' other vertices
+
+
+class PairZip:
+    """A strip of quads and triangles between ring ``a`` of one chain and
+    ring ``b`` of another, both resampled. With equal new counts it becomes
+    clean quads (``b`` is turned to line up with ``a``)."""
+
+    def __init__(self, a, chain_a, b, chain_b, faces, forward):
+        self.a, self.chain_a = a, chain_a
+        self.b, self.chain_b = b, chain_b
+        self.faces = faces
+        self.forward = forward  # old faces run along ring a in increasing parameter
 
 
 def _ring_param(ring, co):
@@ -695,7 +716,7 @@ def _ring_param(ring, co):
     return (p0 + fr * (p1 - p0)) % 1.0
 
 
-def _find_zip_bands(chain, forbidden):
+def _find_zip_bands(chain, forbidden, owners=None, pairs_seen=None):
     used = set(f for s in chain.strips for f in s)
     used.update(f for _, faces, _ in chain.transitions for f in faces)
     for cap in chain.caps:
@@ -738,10 +759,32 @@ def _find_zip_bands(chain, forbidden):
             zb = _zip_band_from(ring, comp, forbidden)
             if zb is not None:
                 bands.append(zb)
+            elif owners is not None:
+                pz = _pair_from(ring, chain, comp, owners, pairs_seen)
+                if pz is not None:
+                    chain.pairs.append(pz)
     return bands
 
 
-def _zip_band_from(ring, comp, forbidden):
+def _pair_from(ring, chain, comp, owners, pairs_seen):
+    """A zig-zag strip from ``ring`` to a ring of another chain, or None."""
+    key = frozenset(comp)
+    if key in pairs_seen:
+        return None
+    zb = _zip_band_from(ring, comp, set(), any_size=True)
+    if zb is None:
+        return None
+    other = owners.get(zb.L[0])
+    if other is None:
+        return None
+    ring_b, chain_b = other
+    if chain_b is chain or set(zb.L) != ring_b.vset or ring_b.thetas is None:
+        return None
+    pairs_seen.add(key)
+    return PairZip(ring, chain, ring_b, chain_b, comp, zb.forward)
+
+
+def _zip_band_from(ring, comp, forbidden, any_size=False):
     vset = ring.vset
     edge_index = {e: k for k, e in enumerate(ring.edges)}
     covered = {}
@@ -749,7 +792,7 @@ def _zip_band_from(ring, comp, forbidden):
     l_edges = set()
     forward = None
     for f in comp:
-        if len(f.verts) > 4:
+        if len(f.verts) > 4 and not any_size:
             return None
         loops = list(f.loops)
         flags = [l.vert in vset for l in loops]
@@ -793,7 +836,63 @@ def _zip_band_from(ring, comp, forbidden):
     return ZipBand(ring, comp, order, pL, forward)
 
 
-def _align_phase(chain, N):
+def tidy_pattern(na, nb, closed, shift=0):
+    """Steps to join a run of ``na`` segments to one of ``nb``: 'Q' (a quad,
+    both advance), 'A' / 'B' (a triangle, only that side advances). The
+    triangles needed for the difference are spread evenly; on an open strip
+    the pattern is also mirrored about its middle. ``shift`` turns a closed
+    pattern."""
+    T = max(na, nb)
+    d = abs(na - nb)
+    extra = 'A' if na > nb else 'B'
+    if d == 0 or T == 0:
+        return ['Q'] * T
+    # Spread whichever is rarer (triangles, or quads when the counts are
+    # very different) evenly; the rest fills the gaps.
+    c = min(d, T - d)
+    rare, common = (extra, 'Q') if c == d else ('Q', extra)
+    if closed:
+        at = {(math.floor((i + 0.5) * T / c) + shift) % T for i in range(c)} if c else set()
+    else:
+        at = set()
+        for i in range(c // 2):
+            p = math.floor((i + 0.5) * T / c)
+            at.add(p)
+            at.add(T - 1 - p)
+        if c % 2:
+            at.add((T - 1) // 2)
+    return [rare if t in at else common for t in range(T)]
+
+
+def _tidy_closed(ua, ub, N, n):
+    """Best (steps, start offset on the b side) for a closed strip with
+    unwrapped parameters ua (N + 1) and ub (n + 1), both from 0: the even
+    pattern turned and started so the joined vertices line up best."""
+    def at(arr, cnt, i):
+        return arr[i % cnt] + i // cnt
+
+    T = max(N, n)
+    d = abs(N - n)
+    shifts = range(max(1, math.ceil(T / d))) if d else [0]
+    j0 = min(range(n), key=lambda j: abs(((ub[j] - ua[0] + 0.5) % 1.0) - 0.5))
+    best = None
+    for off in range(j0 - 2, j0 + 3):
+        for sh in shifts:
+            kinds = tidy_pattern(N, n, True, sh)
+            i, j = 0, off
+            cost = ((at(ua, N, i) - at(ub, n, j) + 0.5) % 1.0 - 0.5) ** 2
+            for kd in kinds:
+                if kd in ('Q', 'A'):
+                    i += 1
+                if kd in ('Q', 'B'):
+                    j += 1
+                cost += ((at(ua, N, i) - at(ub, n, j) + 0.5) % 1.0 - 0.5) ** 2
+            if best is None or cost < best[0] - 1e-12:
+                best = (cost, kinds, off)
+    return best[1], best[2]
+
+
+def _align_phase(chain, N, tidy=False):
     """Rotate the new vertices so they line up with untouched neighbour loops
     whose count matches (or divides evenly into) the new count."""
     xs = []
@@ -805,7 +904,7 @@ def _align_phase(chain, N):
         return
     c = sum(math.cos(TAU * x) for x in xs) / len(xs)
     s = sum(math.sin(TAU * x) for x in xs) / len(xs)
-    if math.hypot(c, s) < 0.95:
+    if math.hypot(c, s) < (1e-6 if tidy else 0.95):
         return  # neighbours don't line up with any rotation
     shift = math.atan2(s, c) / TAU / N
     if abs(shift) < 1e-12:
@@ -814,7 +913,7 @@ def _align_phase(chain, N):
         ring.phase += shift
 
 
-def _rebuild_zip(bm, zb, N, jobs):
+def _rebuild_zip(bm, zb, N, jobs, tidy=False):
     ring = zb.ring
     W = ring.W
     L, pL = zb.L, zb.pL
@@ -835,7 +934,7 @@ def _rebuild_zip(bm, zb, N, jobs):
     for f in zb.faces:
         ps = []
         for v in f.verts:
-            ps.append(ring.params[ring.verts.index(v)] if v in ring.vset else pL[L.index(v)])
+            ps.append(ring.params[ring.verts.index(v)] if v in ring.vset else zb.old_params[v])
         c = sum(math.cos(TAU * p) for p in ps)
         s = sum(math.sin(TAU * p) for p in ps)
         old_mid.append(((math.atan2(s, c) / TAU) % 1.0, f))
@@ -844,20 +943,31 @@ def _rebuild_zip(bm, zb, N, jobs):
         mid = (mid + p0) % 1.0
         return min(old_mid, key=lambda t: abs(((t[0] - mid + 0.5) % 1.0) - 0.5))[1]
 
+    def ubv(j):
+        return ub[j % n] + j // n
+
     def emit(kind, i, j):
         if kind == 'Q':
             vs = [wv(i), wv(i + 1), L[(j + 1) % n], L[j % n]]
-            mid = (ua[i] + ua[i + 1] + ub[j] + ub[j + 1]) / 4
+            mid = (ua[i] + ua[i + 1] + ubv(j) + ubv(j + 1)) / 4
         elif kind == 'A':
             vs = [wv(i), wv(i + 1), L[j % n]]
-            mid = (ua[i] + ua[i + 1] + ub[j]) / 3
+            mid = (ua[i] + ua[i + 1] + ubv(j)) / 3
         else:
             vs = [wv(i), L[(j + 1) % n], L[j % n]]
-            mid = (ua[i] + ub[j] + ub[j + 1]) / 3
+            mid = (ua[i] + ubv(j) + ubv(j + 1)) / 3
         jobs.face(bm, vs if zb.forward else list(reversed(vs)), source(mid))
 
     i = j = 0
-    while i < N or j < n:
+    if tidy:
+        kinds, j = _tidy_closed(ua, ub, N, n)
+        for kind in kinds:
+            emit(kind, i, j)
+            if kind in ('Q', 'A'):
+                i += 1
+            if kind in ('Q', 'B'):
+                j += 1
+    while not tidy and (i < N or j < n):
         if i == N:
             kind = 'B'
         elif j == n:
@@ -1118,7 +1228,7 @@ def _restitch_face(bm, F, ring_lookup, jobs):
     return f
 
 
-def _zip_transition(bm, ring, faces, nb, N, jobs):
+def _zip_transition(bm, ring, faces, nb, N, jobs, tidy=False):
     """Join the resampled ring (N new vertices) to the untouched neighbour ring
     ``nb`` (n vertices, aligned with the old ring) with quads where the
     vertices line up and triangles where the counts differ."""
@@ -1152,7 +1262,15 @@ def _zip_transition(bm, ring, faces, nb, N, jobs):
         jobs.face(bm, vs if fwd else list(reversed(vs)), src)
 
     i = j = 0
-    while i < N or j < n:
+    if tidy:
+        kinds, j = _tidy_closed(ua, ub, N, n)
+        for kind in kinds:
+            emit(kind, i, j)
+            if kind in ('Q', 'A'):
+                i += 1
+            if kind in ('Q', 'B'):
+                j += 1
+    while not tidy and (i < N or j < n):
         if i == N:
             kind = 'B'
         elif j == n:
@@ -1189,13 +1307,129 @@ def _zip_transition(bm, ring, faces, nb, N, jobs):
                     jobs.edge(e, src, seam=False, smooth=True, select=False)
 
 
-def resample(bm, chains, counts, force=False, scale=1.0):
+def _untwist_chain(chain, N):
+    """Turn every ring of the chain to line up with the one before it, so the
+    edges across each strip take the shortest way (a strip that was built
+    twisted keeps its twist otherwise: vertex k always joins vertex k)."""
+    rings = chain.rings
+    for i in range(1, len(rings)):
+        a, b = rings[i - 1], rings[i]
+        if b.thetas is None or b.center is None:
+            continue
+        xs = [(_ring_param(b, p) - k / N) for k, p in enumerate(a.sample(N))]
+        c = sum(math.cos(TAU * x) for x in xs) / len(xs)
+        s = sum(math.sin(TAU * x) for x in xs) / len(xs)
+        if math.hypot(c, s) < 1e-6:
+            continue
+        b.phase = (math.atan2(s, c) / TAU) % 1.0
+
+
+def _align_pairs(pairs, counts_of):
+    """Turn chains so rings joined by a zig-zag strip line up when they get
+    the same count. The first chain of each group keeps its own alignment."""
+    fixed = set()
+    for pz in pairs:
+        na, nb = counts_of.get(id(pz.chain_a)), counts_of.get(id(pz.chain_b))
+        if na is None or nb is None or na != nb:
+            continue
+        a, b, ca, cb = pz.a, pz.b, pz.chain_a, pz.chain_b
+        if id(cb) in fixed and id(ca) not in fixed:
+            a, b, ca, cb = b, a, cb, ca
+        elif id(cb) in fixed:
+            continue
+        fixed.add(id(ca))
+        N = na
+        if b.thetas is None or b.center is None:
+            continue
+        xs = [(_ring_param(b, p) - b.phase) * N for p in a.sample(N)]
+        c = sum(math.cos(TAU * x) for x in xs) / len(xs)
+        s = sum(math.sin(TAU * x) for x in xs) / len(xs)
+        if math.hypot(c, s) < 1e-6:
+            continue
+        shift = math.atan2(s, c) / TAU / N
+        for ring in cb.rings:
+            ring.phase += shift
+        fixed.add(id(cb))
+
+
+def _rebuild_pair(bm, pz, counts_of, jobs, tidy=False):
+    """Rebuild the strip between two selected loops: clean quads when both
+    get the same count (and line up), otherwise a zig-zag of quads and
+    triangles. Returns False when nothing was built."""
+    na, nb = counts_of.get(id(pz.chain_a)), counts_of.get(id(pz.chain_b))
+    a, b = pz.a, pz.b
+    forward = pz.forward
+    if na is None:
+        if nb is None:
+            return False
+        # Only b changes: a stays as it is.
+        a, b, na, nb = b, a, nb, na
+        forward = None
+    if forward is None:
+        e2f = {}
+        for f in pz.faces:
+            for e in f.edges:
+                e2f[e] = f
+        j = next((j for j, e in enumerate(a.edges) if e in e2f), None)
+        if j is None:
+            return False
+        forward = _face_goes(e2f[a.edges[j]], a.verts[j], a.verts[(j + 1) % a.n])
+    N = na
+    if nb == na:
+        if _pair_quads(bm, pz, a, b, N, forward, jobs):
+            return True
+    # Zig-zag: ring a (new vertices) against b's loop (new or old).
+    if nb is not None:
+        L = list(b.W)
+    else:
+        L = list(b.verts)
+    params = {v: _ring_param(a, v.co) for v in L}
+    order = sorted(L, key=lambda v: params[v])
+    pL = [params[v] for v in order]
+    if len(set(round(p, 9) for p in pL)) != len(pL):
+        return False
+    zb = ZipBand(a, pz.faces, order, pL, forward)
+    for v in b.verts:
+        zb.old_params.setdefault(v, _ring_param(a, v.co))
+    _rebuild_zip(bm, zb, N, jobs, tidy)
+    return True
+
+
+def _pair_quads(bm, pz, a, b, N, forward, jobs):
+    """Quads between a.W and b.W (both N), matched by angle around a."""
+    tb = [(_ring_param(b, w.co) - b.phase) * N for w in a.W]
+    sigma = [_round_half_up(x) % N for x in tb]
+    if len(set(sigma)) != N or any(abs(x - round(x)) > 0.25 for x in tb):
+        return False
+    step = (sigma[1] - sigma[0]) % N
+    if step not in (1, N - 1) or any((sigma[(k + 1) % N] - sigma[k]) % N != step for k in range(N)):
+        return False
+    e2f = {}
+    for f in pz.faces:
+        for e in f.edges:
+            e2f[e] = f
+    for k in range(N):
+        k1 = (k + 1) % N
+        j, _ = a.locate(a.new_param(k, N, 0.5))
+        src = e2f.get(a.edges[j]) or next(iter(pz.faces))
+        if forward:
+            vs = [a.W[k], a.W[k1], b.W[sigma[k1]], b.W[sigma[k]]]
+        else:
+            vs = [a.W[k1], a.W[k], b.W[sigma[k]], b.W[sigma[k1]]]
+        jobs.face(bm, vs, src)
+    return True
+
+
+def resample(bm, chains, counts, force=False, scale=1.0, tidy=False):
     """Resample ``chains`` (from ``analyze`` on this same bm) to ``counts``.
 
     Chains whose target equals their current count are left untouched unless
     ``force`` is set (useful to re-fit a ring to a perfect circle) or the
     rings are scaled. ``scale`` multiplies every ring's radius (in its own
-    plane, about its own center). Returns the number of chains rebuilt.
+    plane, about its own center). ``tidy``: the strips to neighbouring loops
+    are rebuilt with an even, symmetric pattern (quads where the counts
+    match, evenly spread triangles where they don't), also at the same count.
+    Returns the number of chains rebuilt.
     """
     import bmesh
 
@@ -1207,7 +1441,7 @@ def resample(bm, chains, counts, force=False, scale=1.0):
         for ring in chain.rings:
             ring.scale = max(scale, 1e-3)
         N = max(MIN_SEGMENTS, min(MAX_SEGMENTS, int(N)))
-        if N == chain.n:
+        if N == chain.n and not (tidy and (chain.transitions or chain.zips or chain.pairs or chain.strips)):
             if force or scale != 1.0:
                 in_place.append(chain)
             continue
@@ -1229,7 +1463,16 @@ def resample(bm, chains, counts, force=False, scale=1.0):
     old_ring_edges = set()
 
     for chain, N in active:
-        _align_phase(chain, N)
+        if tidy:
+            _untwist_chain(chain, N)
+        _align_phase(chain, N, tidy)
+    counts_of = {id(chain): N for chain, N in active}
+    pair_zips = [pz for chain, _ in active for pz in chain.pairs]
+    pair_zips += [pz for chain in chains for pz in chain.pairs
+              if id(chain) not in counts_of and id(pz.chain_b) in counts_of]
+    _align_pairs(pair_zips, counts_of)
+
+    for chain, N in active:
         # -- new ring vertices + ring edges ------------------------------------
         for ring in chain.rings:
             ring.N = N
@@ -1273,10 +1516,10 @@ def resample(bm, chains, counts, force=False, scale=1.0):
 
         # -- transitions to unselected rings ------------------------------------
         for ring, faces, nb in chain.transitions:
-            _zip_transition(bm, ring, faces, nb, N, jobs)
+            _zip_transition(bm, ring, faces, nb, N, jobs, tidy)
             handled.update(faces)
         for zb in chain.zips:
-            _rebuild_zip(bm, zb, N, jobs)
+            _rebuild_zip(bm, zb, N, jobs, tidy)
             handled.update(zb.faces)
 
         # -- caps ------------------------------------------------------------
@@ -1304,6 +1547,11 @@ def resample(bm, chains, counts, force=False, scale=1.0):
                 old_spokes = [edge_between(ring.verts[j], apex) for j in range(n)]
                 pairs = [(W[k], apex) for k in range(N)]
                 _transfer_rails(bm, ring, N, pairs, old_spokes, jobs)
+
+    # -- strips between two resampled (or one resampled) selected loops --------
+    for pz in pair_zips:
+        if _rebuild_pair(bm, pz, counts_of, jobs, tidy):
+            handled.update(pz.faces)
 
     # -- everything else touching the rings: re-stitch ------------------------
     affected = []

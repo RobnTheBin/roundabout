@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Roundabout",
     "author": "Robin Mariančík",
-    "version": (1, 0, 1),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "Edit Mesh > select ring loops or a bevel profile > Alt+T, then mouse wheel / drag",
     "description": "Resample loops, arcs and bevels interactively: segments, radius, tension",

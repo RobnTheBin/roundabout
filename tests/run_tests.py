@@ -1455,6 +1455,115 @@ def bevel_radius_with_triangulated_cap():
 
 
 @test
+def chamfer_loop_radius_with_sharp_corners():
+    # A chamfer all around a D-shaped plate (half ellipse + one long straight
+    # edge, fan-triangulated cap). At the two sharp corners the neighbouring
+    # rim edges differ a lot in length; the miter columns must still find
+    # their corner, or radius is off for the whole loop.
+    pts = [(1.5 * math.cos(math.pi * i / 23), math.sin(math.pi * i / 23)) for i in range(24)] + [(0.0, -0.2)]
+    bm = bmesh.new()
+    bot = [bm.verts.new((x, y, 0.0)) for x, y in pts]
+    top = [bm.verts.new((x, y, 0.5)) for x, y in pts]
+    n = len(pts)
+    for i in range(n):
+        j = (i + 1) % n
+        bm.faces.new((bot[i], bot[j], top[j], top[i]))
+    bm.faces.new(top)
+    bm.faces.new(list(reversed(bot)))
+    bm.normal_update()
+    rim = [e for e in bm.edges if all(abs(v.co.z - 0.5) < 1e-6 for v in e.verts)]
+    bmesh.ops.bevel(bm, geom=rim, offset=0.05, segments=1, affect='EDGES')
+    cap = max(bm.faces, key=lambda f: len(f.verts) if all(abs(v.co.z - 0.5) < 1e-6 for v in f.verts) else 0)
+    bmesh.ops.triangulate(bm, faces=[cap], ngon_method='BEAUTY')
+    ob = new_object_from_bm(bm, "Plate")
+    bm = edit(ob)
+    select_edges(bm, lambda e: min(v.co.z for v in e.verts) > 0.4 and abs(e.verts[0].co.z - e.verts[1].co.z) > 1e-6)
+    bmesh.update_edit_mesh(ob.data)
+    bands = curves.analyze(bmesh.from_edit_mesh(ob.data))
+    expect(len(bands) == 1 and bands[0].closed and bands[0].has_radius(),
+           f"{[(b.m, len(b.columns), b.closed, b.has_radius()) for b in bands]}")
+    run_op(radius_scale=1.5)
+    bm = bmesh.from_edit_mesh(ob.data)
+    wall = {round(v.co.z, 5) for v in bm.verts if 0.3 < v.co.z < 0.49}
+    expect(wall == {0.425}, f"chamfer wall edge heights {wall} (expected all at 0.425)")
+    expect(not check_topology(bm), check_topology(bm))
+
+
+@test
+def chamfer_loop_radius_with_twisted_columns():
+    # A hand-made chamfer: its inner edge is nudged along the rim, so the two
+    # legs of every column pass each other instead of meeting. Radius must
+    # still work on the whole loop.
+    n = 24
+    bm = bmesh.new()
+    bot = [bm.verts.new((math.cos(TAU * i / n), math.sin(TAU * i / n), 0.0)) for i in range(n)]
+    top = [bm.verts.new((math.cos(TAU * i / n), math.sin(TAU * i / n), 0.5)) for i in range(n)]
+    for i in range(n):
+        j = (i + 1) % n
+        bm.faces.new((bot[i], bot[j], top[j], top[i]))
+    bm.faces.new(top)
+    bm.faces.new(list(reversed(bot)))
+    bm.normal_update()
+    rim = [e for e in bm.edges if all(abs(v.co.z - 0.5) < 1e-6 for v in e.verts)]
+    bmesh.ops.bevel(bm, geom=rim, offset=0.05, segments=1, affect='EDGES')
+    for k, v in enumerate(v for v in bm.verts if abs(v.co.z - 0.5) < 1e-6):
+        a = math.atan2(v.co.y, v.co.x) + (0.008 if k % 2 else -0.008)  # ~0.008 along the rim
+        r = v.co.xy.length
+        v.co.x, v.co.y = r * math.cos(a), r * math.sin(a)
+    ob = new_object_from_bm(bm, "Twisted")
+    bm = edit(ob)
+    select_edges(bm, lambda e: min(v.co.z for v in e.verts) > 0.4 and abs(e.verts[0].co.z - e.verts[1].co.z) > 1e-6)
+    bmesh.update_edit_mesh(ob.data)
+    bands = curves.analyze(bmesh.from_edit_mesh(ob.data))
+    expect(len(bands) == 1 and bands[0].has_radius(),
+           f"{[(b.m, len(b.columns), b.has_radius()) for b in bands]}")
+    run_op(radius_scale=1.5)
+    bm = bmesh.from_edit_mesh(ob.data)
+    wall = [v.co.z for v in bm.verts if 0.3 < v.co.z < 0.49]
+    expect(len(wall) == n and max(abs(z - 0.425) for z in wall) < 2e-3,
+           f"chamfer wall edge heights {sorted({round(z, 4) for z in wall})} (expected about 0.425)")
+    expect(not check_topology(bm), check_topology(bm))
+
+
+@test
+def curves_across_zigzag_strip_become_one_band():
+    # Parallel arches with the same segment count, where the strip between
+    # two of them is a zig-zag of triangles (what resampling two separate
+    # groups leaves behind). Selected together they are one band, and the
+    # zig-zag is rebuilt as clean quads.
+    bm = bmesh.new()
+    cols = []
+    for off, y in ((0.0, 0.0), (0.05, 0.0), (0.1, 0.05), (0.2, 0.05)):
+        r = 1.0 + off
+        path = [(-r, -1.5)] + [(r * math.cos(math.pi - math.pi * i / 8), r * math.sin(math.pi - math.pi * i / 8))
+                               for i in range(9)] + [(r, -1.5)]
+        cols.append([bm.verts.new((x, y, z)) for x, z in path])
+    for c in range(3):
+        A, B = cols[c], cols[c + 1]
+        for i in range(len(A) - 1):
+            if c == 1 and i % 2:
+                bm.faces.new((A[i], A[i + 1], B[i + 1]))
+                bm.faces.new((A[i], B[i + 1], B[i]))
+            elif c == 1:
+                bm.faces.new((A[i], A[i + 1], B[i]))
+                bm.faces.new((A[i + 1], B[i + 1], B[i]))
+            else:
+                bm.faces.new((A[i], A[i + 1], B[i + 1], B[i]))
+    ob = new_object_from_bm(bm, "Arches")
+    bm = edit(ob)
+    n = len(cols[0])  # vertices were made column by column
+    select_edges(bm, lambda e: e.verts[0].index // n == e.verts[1].index // n)
+    bmesh.update_edit_mesh(ob.data)
+    bands = curves.analyze(bmesh.from_edit_mesh(ob.data))
+    expect(len(bands) == 1 and len(bands[0].columns) == 4, f"{[(b.m, len(b.columns)) for b in bands]}")
+    run_op(delta=3)
+    bm = bmesh.from_edit_mesh(ob.data)
+    sizes = sorted({len(f.verts) for f in bm.faces})
+    expect(sizes == [4] and len(bm.faces) == 3 * 13, f"face sizes {sizes}, {len(bm.faces)} faces (expected 39 quads)")
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+
+
+@test
 def selected_round_trip_restores_clean_quads():
     # Change only the middle loop, confirm, then change it back: the bands
     # to the neighbours must be clean quads again, rails straight.

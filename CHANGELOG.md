@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Radius works on a chamfer looped around a shape with sharp corners; the corner (miter) edges no longer turn it off for the whole loop, and they scale in step with the rest.
+- Radius works on hand-made chamfers whose faces are slightly twisted, and on chamfer edges that only touch quads when the rest of the loop is a real chamfer.
+- Parallel open curves with the same segment count stay one band even when the strip between them is a zig-zag of triangles (e.g. left by an earlier resample), and that strip is rebuilt as clean quads.
+
 ## 1.0.0
 
 First public release.

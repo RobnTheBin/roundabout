@@ -153,11 +153,92 @@ def _next_column(col, edges, f):
     return nxt, faces
 
 
+def _fan_faces(v, f, e_from, e_to, limit=64):
+    """Faces around v from face f (which holds edge e_from) to the face that
+    holds e_to, walking away from e_from. None if the fan is not manifold."""
+    out = []
+    e_cur = e_from
+    for _ in range(limit):
+        out.append(f)
+        l = next((lp for lp in f.loops if lp.vert == v), None)
+        if l is None:
+            return None
+        e_other = l.edge if l.edge != e_cur else l.link_loop_prev.edge
+        if e_other == e_to:
+            return out
+        nxt = [x for x in e_other.link_faces if x != f]
+        if len(nxt) != 1:
+            return None
+        f, e_cur = nxt[0], e_other
+    return None
+
+
+def _zip_column(col, edges, f):
+    """The column next to ``col`` across a strip that is not a clean quad
+    strip but a zig-zag of quads and triangles (what an earlier resample of
+    two separately resampled bands leaves between them). The next column must
+    have the same number of segments and be joined to ``col`` by one edge at
+    each end. Returns (verts, row faces, all strip faces) or None."""
+    m = len(edges)
+    fwd = _face_goes(f, col[0], col[1])
+    row = []
+    for i, e in enumerate(edges):
+        fs = [x for x in e.link_faces if _face_goes(x, col[i], col[i + 1]) == fwd]
+        if len(fs) != 1:
+            return None
+        row.append(fs[0])
+    region = set(row)
+    for i in range(1, m):
+        fan = _fan_faces(col[i], row[i - 1], edges[i - 1], edges[i])
+        if fan is None:
+            return None
+        region.update(fan)
+    # The strip's outline: col, a rung, the next column, a rung.
+    count = {}
+    for x in region:
+        for e in x.edges:
+            count[e] = count.get(e, 0) + 1
+    cset = set(col)
+    eset = set(edges)
+    adj = {}
+    for e, k in count.items():
+        if k == 1 and e not in eset:
+            for v in e.verts:
+                adj.setdefault(v, []).append(e)
+    if len(adj.get(col[0], ())) != 1 or len(adj.get(col[m], ())) != 1:
+        return None
+    path = [col[0]]
+    cur, e = col[0], adj[col[0]][0]
+    while True:
+        cur = e.other_vert(cur)
+        path.append(cur)
+        if cur == col[m]:
+            break
+        if cur in cset or len(adj.get(cur, ())) != 2 or len(path) > m + 3:
+            return None
+        e = adj[cur][0] if adj[cur][1] == e else adj[cur][1]
+    nxt = path[1:-1]
+    if len(nxt) != m + 1 or len(set(nxt)) != m + 1:
+        return None
+    nset = set(nxt)
+    # Every face spans both columns, and none spans most of either (that
+    # would be a cap n-gon, not a strip).
+    most = max(1, m // 2)
+    for x in region:
+        vs = set(x.verts)
+        if not vs <= (cset | nset) or not (vs & cset) or not (vs & nset):
+            return None
+        if len(vs & cset) > most + 1 or len(vs & nset) > most + 1:
+            return None
+    return nxt, row, region
+
+
 class Band:
     def __init__(self):
         self.columns = []    # vertex lists, all m + 1 long
         self.col_edges = []  # col_edges[c][i]: edge between rows i and i + 1
         self.strips = []     # strips[c][i]: face between columns c, c + 1 and rows i, i + 1
+        self.extra = set()   # other faces of zig-zag strips (rebuilt as quads too)
         self.closed = False
         self.m = 0
         self.curves = []
@@ -170,7 +251,7 @@ class Band:
         self.M = 0
 
     def faces(self):
-        return set(f for s in self.strips for f in s)
+        return set(f for s in self.strips for f in s) | self.extra
 
     def has_radius(self):
         """Every column has something to scale about (a corner or a circle)."""
@@ -203,14 +284,20 @@ def build_band(path):
         cur, cur_edges = col0, edges0
         while f is not None:
             res = _next_column(cur, cur_edges, f)
-            if res is None:
-                return
-            nxt, faces = res
-            if used_faces.intersection(faces):
+            if res is not None:
+                nxt, faces = res
+                region = set(faces)
+            else:
+                res = _zip_column(cur, cur_edges, f)
+                if res is None:
+                    return
+                nxt, faces, region = res
+            if used_faces.intersection(region):
                 return
             if forward and nxt == col0:
                 band.strips.append(faces)
-                used_faces.update(faces)
+                band.extra |= region - set(faces)
+                used_faces.update(region)
                 band.closed = True
                 return
             if any(v in claimed for v in nxt):
@@ -219,7 +306,8 @@ def build_band(path):
             if any(e is None for e in nedges):
                 return
             claimed.update(nxt)
-            used_faces.update(faces)
+            used_faces.update(region)
+            band.extra |= region - set(faces)
             if forward:
                 band.columns.append(nxt)
                 band.col_edges.append(nedges)
@@ -229,8 +317,7 @@ def build_band(path):
                 band.col_edges.insert(0, nedges)
                 band.strips.insert(0, faces)
                 band.sel += 1
-            fs = set(faces)
-            others = [x for x in nedges[0].link_faces if x not in fs]
+            others = [x for x in nedges[0].link_faces if x not in region]
             f = others[0] if len(others) == 1 else None
             cur, cur_edges = nxt, nedges
 
@@ -314,6 +401,31 @@ def _end_tangent(P):
          + (h1 + h2) / (h1 * h2) * P[1]
          - h1 / (h2 * (h1 + h2)) * P[2])
     return _unit(d)
+
+
+def _coplanar_legs(A, B, dA, dB):
+    """Legs of a single segment A-B flattened into one plane through it, so
+    that they meet: on hand-made meshes the faces on either side of a chamfer
+    are often a little twisted, and the two legs pass each other by a few
+    percent of the chamfer's width."""
+    if dA is None or dB is None:
+        return dA, dB
+    u = _unit(B - A)
+    if u is None:
+        return dA, dB
+    pA = _unit(dA - u * dA.dot(u))
+    pB = _unit(dB - u * dB.dot(u))
+    if pA is None or pB is None:
+        return dA, dB
+    w = _unit(pA + pB)  # where both legs come from, across the segment
+    if w is None:
+        return dA, dB
+    n = np.cross(u, w)
+    fA = _unit(dA - n * dA.dot(n))
+    fB = _unit(dB - n * dB.dot(n))
+    if fA is None or fB is None:
+        return dA, dB
+    return fA, fB
 
 
 def _corner(A, B, dA, dB):
@@ -714,11 +826,12 @@ class Curve:
         return None
 
     def radius(self):
-        """Size the radius drag works on: the leg length for a bevel (its
-        width for a square corner), the circle radius for an arc."""
+        """Size the radius drag works on: the shorter leg for a bevel (its
+        width; at a miter the other leg is the longer corner diagonal, which
+        follows in proportion), the circle radius for an arc."""
         if self.legs:
             _, a, b = self.frame
-            return 0.5 * float(np.linalg.norm(a) + np.linalg.norm(b))
+            return float(min(np.linalg.norm(a), np.linalg.norm(b)))
         if self.circle is not None:
             return self.circle_r
         return 0.0
@@ -814,31 +927,51 @@ def _fit_band(band, fit_mode, cache=None):
         nxt = c + 1 if (c < K - 1 or band.closed) else None
         if K < 2 or (prev is None and nxt is None):
             return None
-        a = cols[prev % K][r] if prev is not None else cols[c][r]
-        b = cols[nxt % K][r] if nxt is not None else cols[c][r]
-        return _unit(_np(b.co) - _np(a.co))
+        # Average of the unit directions in and out: at a sharp corner of the
+        # band (the miter of a chamfer loop) this stays square to the corner's
+        # bisector however different the two neighbouring edges are in length.
+        here = _np(cols[c][r].co)
+        t = np.zeros(3)
+        if prev is not None:
+            d = _unit(here - _np(cols[prev % K][r].co))
+            if d is not None:
+                t += d
+        if nxt is not None:
+            d = _unit(_np(cols[nxt % K][r].co) - here)
+            if d is not None:
+                t += d
+        return _unit(t)
 
-    band.curves = []
-    fresh = []
+    band.curves = [None] * K
+    pending = []
     for c, col in enumerate(cols):
         key = tuple(v.index for v in col)
         cv = cache.get(key) if cache is not None else None
-        if cv is None:
-            # Legs are taken in the column's own plane (the profile plane),
-            # which rows curving around a corner don't tilt; a single-segment
-            # column has no plane of its own, so the row direction stands in.
-            n = _column_normal(col)
-            dA, kA = _leg_dir(col[0], col[1], bf, n if n is not None else tangent(c, 0))
-            dB, kB = _leg_dir(col[m], col[m - 1], bf, n if n is not None else tangent(c, m))
-            if kA == 'quad' and kB == 'quad':
-                # Both ends only touch plain quads: a plain corner edge of a
-                # box, not a bevel or chamfer. No corner to work with.
-                dA = dB = None
-            cv = Curve(col, dA, dB)
-            fresh.append(cv)
-            if cache is not None:
-                cache[key] = cv
-        band.curves.append(cv)
+        if cv is not None:
+            band.curves[c] = cv
+            continue
+        # Legs are taken in the column's own plane (the profile plane),
+        # which rows curving around a corner don't tilt; a single-segment
+        # column has no plane of its own, so the row direction stands in.
+        n = _column_normal(col)
+        dA, kA = _leg_dir(col[0], col[1], bf, n if n is not None else tangent(c, 0))
+        dB, kB = _leg_dir(col[m], col[m - 1], bf, n if n is not None else tangent(c, m))
+        if m == 1:
+            dA, dB = _coplanar_legs(_np(col[0].co), _np(col[1].co), dA, dB)
+        pending.append((c, key, dA, dB, kA == 'quad' and kB == 'quad'))
+    # Both ends of every column only touch plain quads: a plain corner edge
+    # of a box, not a bevel or chamfer, so no corner to work with. In a band
+    # whose other columns are a real bevel, such a column is part of it.
+    plain = all(p[4] for p in pending)
+    fresh = []
+    for c, key, dA, dB, qq in pending:
+        if qq and plain:
+            dA = dB = None
+        cv = Curve(cols[c], dA, dB)
+        fresh.append(cv)
+        if cache is not None:
+            cache[key] = cv
+        band.curves[c] = cv
     fit_curves(fresh)
 
     cvs = band.curves
@@ -1031,7 +1164,9 @@ def _rebuild_band(bm, bid, band, M, pts, jobs, lookup):
         for k in range(M):
             i = min(m - 1, int((k + 0.5) * m / M))
             fo = strip[i]
-            if _face_goes(fo, colA[i], colA[i + 1]):
+            # A zig-zag strip's row face may hold only the other column's edge.
+            if (band.col_edges[c][i] in fo.edges and _face_goes(fo, colA[i], colA[i + 1])) or (
+                    band.col_edges[c][i] not in fo.edges and not _face_goes(fo, colB[i], colB[i + 1])):
                 vs = [A[k], A[k + 1], B[k + 1], B[k]]
             else:
                 vs = [A[k + 1], A[k], B[k], B[k + 1]]
@@ -1129,8 +1264,8 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0):
             for col, P in zip(band.columns, pts):
                 col[0].co = Vector(P[0].tolist())
                 col[-1].co = Vector(P[-1].tolist())
-        if M == band.m:
-            # Same count: only move the vertices.
+        if M == band.m and not band.extra:
+            # Same count: only move the vertices (a zig-zag strip is rebuilt).
             for col, P in zip(band.columns, pts):
                 for i in range(1, M):
                     col[i].co = Vector(P[i].tolist())

@@ -604,7 +604,10 @@ def steps():
     log(counts() == (25, 25, 25, 25), f"E matches the highest {counts()}")
     ev('D', 'PRESS')
     yield 0.3
-    log(counts() == (25, 25, 25, 25), f"D right after E: all equal already {counts()}")
+    log(counts() == (17, 17, 17, 17), f"D right after E: the lowest of the counts before E {counts()}")
+    ev('E', 'PRESS')
+    yield 0.3
+    log(counts() == (25, 25, 25, 25), f"E again: back to the highest {counts()}")
     ev('ESC', 'PRESS')
     yield 0.3
     ev('T', 'PRESS', alt=True)
@@ -617,6 +620,57 @@ def steps():
     ev('ESC', 'PRESS')
     yield 0.3
     log(counts() == (16, 16, 24, 24), f"Esc restores the mixed counts {counts()}")
+
+    # --- curves with mixed counts: E / D match them too ------------------------
+    bpy.ops.object.mode_set(mode='OBJECT')
+    for o in list(bpy.data.objects):
+        bpy.data.objects.remove(o)
+    bm = bmesh.new()
+    for segs, dx in ((16, -1.5), (24, 1.5)):
+        geom = bmesh.ops.create_cone(bm, cap_ends=True, segments=segs, radius1=1, radius2=1, depth=2)
+        bmesh.ops.translate(bm, vec=(dx, 0, 0), verts=geom["verts"])
+    me = bpy.data.meshes.new("MixedCurves")
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("MixedCurves", me)
+    bpy.context.scene.collection.objects.link(ob)
+    bpy.context.view_layer.objects.active = ob
+    ob.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+    bm = bmesh.from_edit_mesh(me)
+    for e in bm.edges:  # the front half of each top loop: open arcs of 8 and 12 segments
+        e.select = all(abs(v.co.z - 1.0) < 1e-5 and v.co.y > 1e-5 for v in e.verts) or (
+            all(abs(v.co.z - 1.0) < 1e-5 for v in e.verts) and any(v.co.y > 1e-5 for v in e.verts)
+            and all(v.co.y > -1e-5 for v in e.verts))
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(me)
+    bpy.ops.ed.undo_push(message="mixed curves setup")
+    yield 0.3
+
+    def top_counts():
+        bm = bmesh.from_edit_mesh(bpy.context.edit_object.data)
+        return tuple(sum(1 for v in bm.verts if abs(v.co.z - 1.0) < 1e-5 and v.co.x * side > 0) for side in (-1, 1))
+
+    start = top_counts()
+    ev('T', 'PRESS', alt=True)
+    ev('T', 'RELEASE', alt=True)
+    yield 0.3
+    # The arcs have 8 and 12 segments: E -> both 12 (left top loop 16 -> 20 points).
+    ev('E', 'PRESS')
+    yield 0.3
+    log(top_counts() == (20, 24), f"curves: E matches the highest {start} -> {top_counts()}")
+    ev('ESC', 'PRESS')
+    yield 0.3
+    log(top_counts() == start, f"curves: Esc restores {top_counts()}")
+    ev('T', 'PRESS', alt=True)
+    ev('T', 'RELEASE', alt=True)
+    yield 0.3
+    ev('D', 'PRESS')  # both 8 (right top loop 24 -> 20 points)
+    yield 0.3
+    log(top_counts() == (16, 20), f"curves: D matches the lowest {start} -> {top_counts()}")
+    ev('ESC', 'PRESS')
+    yield 0.3
 
 
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+
+- E and D switch freely: they match against the counts from before the first E / D, so after D you can press E to get the highest count back (until you change the count another way).
+- The strip between two selected curves side by side is rebuilt with them, whatever faces it holds. With the same count, point 0 joins point 0, 1 joins 1 and so on, the end points too; a vertex where other geometry meets the ends gets a small face of its own beside the strip. With different counts the even pattern is used. With tidy (R) this also happens without changing the count. Before, it was patched face by face and stayed messy.
+- Selected curves side by side with different counts, where one lines up with only part of the other, are both found as curves of their own, so E / D and exact counts change both (before, only one was).
+- The hint next to the cursor always lists E / D (match max / min), not only while the selected counts differ.
+- Two selected curves with the same count, joined by a zig-zag, are now lined up and rebuilt as quads even when one end of the strip runs through an extra vertex (where other geometry meets them). The end points are joined directly, and that vertex gets a small face of its own.
+
 ## 1.1.0
 
 - Shorter labels on screen: perfect circle, select similar, tidy, selected / whole, match max / min.

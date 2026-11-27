@@ -173,13 +173,17 @@ def _fan_faces(v, f, e_from, e_to, limit=64):
     return None
 
 
-def _zip_column(col, edges, f, same_count=True):
+def _zip_column(col, edges, f, same_count=True, targets=None):
     """The column next to ``col`` across a strip that is not a clean quad
     strip but a zig-zag of quads and triangles (what an earlier resample of
     two separately resampled bands leaves between them). The next column must
     be joined to ``col`` by one edge at each end and (with ``same_count``)
-    have the same number of segments. Returns (verts, row faces, all strip
-    faces) or None."""
+    have the same number of segments. With ``targets`` (the vertices of the
+    selected paths), the next column must be a selected path, and the ends
+    may be joined through other vertices (where other geometry meets the
+    strip); those stay in the end faces. Returns (verts, row faces, all
+    strip faces, (start extras, end extras)) or None; the extras run from
+    this column to the next one."""
     m = len(edges)
     fwd = _face_goes(f, col[0], col[1])
     row = []
@@ -215,24 +219,38 @@ def _zip_column(col, edges, f, same_count=True):
         path.append(cur)
         if cur == col[m]:
             break
-        if cur in cset or len(adj.get(cur, ())) != 2 or len(path) > (m + 3 if same_count else 4 * m + 8):
+        limit = m + 3 if same_count and targets is None else 4 * m + 8
+        if cur in cset or len(adj.get(cur, ())) != 2 or len(path) > limit:
             return None
         e = adj[cur][0] if adj[cur][1] == e else adj[cur][1]
     nxt = path[1:-1]
+    e0, e1 = [], []
+    if targets is not None:
+        a = 0
+        while a < len(nxt) and nxt[a] not in targets:
+            a += 1
+        b = len(nxt)
+        while b > a and nxt[b - 1] not in targets:
+            b -= 1
+        e0, e1 = nxt[:a], nxt[b:][::-1]
+        nxt = nxt[a:b]
+        if not all(v in targets for v in nxt):
+            return None
     if len(nxt) < 2 or len(set(nxt)) != len(nxt) or (same_count and len(nxt) != m + 1):
         return None
     nset = set(nxt)
+    xset = set(e0) | set(e1)
     # Every face spans both columns, and none spans most of either (that
     # would be a cap n-gon, not a strip).
     most_c = max(1, m // 2)
     most_n = max(1, (len(nxt) - 1) // 2)
     for x in region:
         vs = set(x.verts)
-        if not vs <= (cset | nset) or not (vs & cset) or not (vs & nset):
+        if not vs <= (cset | nset | xset) or not (vs & cset) or not (vs & nset):
             return None
         if len(vs & cset) > most_c + 1 or len(vs & nset) > most_n + 1:
             return None
-    return nxt, row, region
+    return nxt, row, region, (e0, e1)
 
 
 class Band:
@@ -242,7 +260,10 @@ class Band:
         self.strips = []     # strips[c][i]: face between columns c, c + 1 and rows i, i + 1
         self.extra = set()   # other faces of zig-zag strips (rebuilt as quads too)
         self.regions = []    # regions[c]: every face of strip c (row faces and extra)
+        self.ends = []       # ends[c]: (start, end) vertices on strip c's end rungs, from column c to c + 1
         self.sides = []      # (end, column, row faces, faces): unchanged neighbours at open ends
+        self.pairs = []      # strips from an end column to the end column of another selected band
+        self.has_pair = False
         self.closed = False
         self.m = 0
         self.curves = []
@@ -265,7 +286,7 @@ class Band:
         return set(v for col in self.columns for v in col[1:-1])
 
 
-def build_band(path):
+def build_band(path, targets=None):
     col0 = list(path)
     m = len(col0) - 1
     if m < 1:
@@ -280,6 +301,9 @@ def build_band(path):
     claimed = set(col0)
     used_faces = set()
 
+    def cur_selected(edges):
+        return targets is not None and all(e.select for e in edges)
+
     sides = list(edges0[0].link_faces)
     if len(sides) > 2:
         sides = []
@@ -288,19 +312,23 @@ def build_band(path):
         cur, cur_edges = col0, edges0
         while f is not None:
             res = _next_column(cur, cur_edges, f)
+            ends = ([], [])
             if res is not None:
                 nxt, faces = res
                 region = set(faces)
             else:
                 res = _zip_column(cur, cur_edges, f)
+                if res is None and cur_selected(cur_edges):
+                    res = _zip_column(cur, cur_edges, f, targets=targets)
                 if res is None:
                     return
-                nxt, faces, region = res
+                nxt, faces, region, ends = res
             if used_faces.intersection(region):
                 return
             if forward and nxt == col0:
                 band.strips.append(faces)
                 band.regions.append(region)
+                band.ends.append(ends)
                 band.extra |= region - set(faces)
                 used_faces.update(region)
                 band.closed = True
@@ -318,11 +346,13 @@ def build_band(path):
                 band.col_edges.append(nedges)
                 band.strips.append(faces)
                 band.regions.append(region)
+                band.ends.append(ends)
             else:
                 band.columns.insert(0, nxt)
                 band.col_edges.insert(0, nedges)
                 band.strips.insert(0, faces)
                 band.regions.insert(0, region)
+                band.ends.insert(0, (ends[0][::-1], ends[1][::-1]))
                 band.sel += 1
             others = [x for x in nedges[0].link_faces if x not in region]
             f = others[0] if len(others) == 1 else None
@@ -1007,16 +1037,24 @@ def _sub_band(band, run):
     sub.col_edges = [band.col_edges[i] for i in run]
     sub.strips = [band.strips[i] for i in run[:-1]]
     sub.regions = [band.regions[i] for i in run[:-1]]
+    sub.ends = [band.ends[i] for i in run[:-1]]
     for strip, region in zip(sub.strips, sub.regions):
         sub.extra |= region - set(strip)
     sub.sel = run.index(band.sel) if band.sel in run else 0
     return sub
 
 
-def _selected_runs(band):
-    """Runs of consecutive selected columns (indices in band order)."""
+def _selected_runs(band, path_of=None):
+    """Runs of consecutive selected columns (indices in band order). A column
+    that is only part of a longer selected path does not count (that path is
+    a curve of its own, with its own band)."""
     K = len(band.columns)
     sel = [all(e.select for e in ce) for ce in band.col_edges]
+    if path_of:
+        for c, col in enumerate(band.columns):
+            owner = {path_of.get(v) for v in col}
+            if sel[c] and len(owner) == 1 and None not in owner and len(next(iter(owner))) > len(col):
+                sel[c] = False
     if all(sel):
         return [list(range(K))]
     start = next(i for i in range(K) if not sel[i]) if band.closed else 0
@@ -1031,6 +1069,114 @@ def _selected_runs(band):
     if cur:
         runs.append(cur)
     return runs
+
+
+def _short_path(a, b, avoid, maxlen=3):
+    """Vertices of a shortest edge path a -> b (at most ``maxlen`` edges)
+    whose inner vertices are not in ``avoid``; None if there is none."""
+    prev = {a: None}
+    frontier = [a]
+    for _ in range(maxlen):
+        nxt = []
+        for v in frontier:
+            for e in v.link_edges:
+                w = e.other_vert(v)
+                if w in prev:
+                    continue
+                if w is b:
+                    prev[w] = v
+                    out = [w]
+                    while prev[out[-1]] is not None:
+                        out.append(prev[out[-1]])
+                    return out[::-1]
+                if w in avoid:
+                    continue
+                prev[w] = v
+                nxt.append(w)
+        frontier = nxt
+    return None
+
+
+def _strip_between(colA, colB):
+    """The strip of faces between two curves lying side by side: their end
+    vertices joined by short paths (a direct edge, or through vertices where
+    other geometry meets them), and every face inside that outline, whatever
+    its shape. Returns (curve B ordered like A, row face of each A edge,
+    faces, (start path, end path) inner vertices from A to B) or None."""
+    m = len(colA) - 1
+    eA = [edge_between(colA[i], colA[i + 1]) for i in range(m)]
+    eB = [edge_between(colB[i], colB[i + 1]) for i in range(len(colB) - 1)]
+    if any(e is None for e in eA + eB):
+        return None
+    setA, setB = set(colA), set(colB)
+    if setA & setB:
+        return None
+    limit = 4 * (len(colA) + len(colB)) + 8
+    for Bo in (list(colB), list(colB)[::-1]):
+        avoid = setA | setB
+        c0 = _short_path(colA[0], Bo[0], avoid)
+        c1 = _short_path(colA[-1], Bo[-1], avoid)
+        if c0 is None or c1 is None or set(c0[1:-1]) & set(c1[1:-1]):
+            continue
+        cyc = setA | setB | set(c0) | set(c1)
+        bound = set(eA) | set(eB)
+        for path in (c0, c1):
+            for x, y in zip(path, path[1:]):
+                bound.add(edge_between(x, y))
+        for f0 in eA[0].link_faces:
+            region = {f0}
+            stack = [f0]
+            ok = True
+            while stack and ok:
+                f = stack.pop()
+                for e in f.edges:
+                    if e in bound:
+                        continue
+                    for g in e.link_faces:
+                        if g not in region:
+                            region.add(g)
+                            stack.append(g)
+                            if len(region) > limit:
+                                ok = False
+            if not ok or not all(set(f.verts) <= cyc for f in region):
+                continue
+            rows = []
+            for e in eA:
+                fs = [f for f in e.link_faces if f in region]
+                if len(fs) != 1:
+                    ok = False
+                    break
+                rows.append(fs[0])
+            if not ok or any(sum(f in region for f in e.link_faces) != 1 for e in eB):
+                continue
+            return Bo, rows, region, (c0[1:-1], c1[1:-1])
+    return None
+
+
+def _find_pairs(bands, taken_f):
+    """Strips between end columns of two different selected bands."""
+    for band in bands:
+        band.has_pair = False
+    ends = []
+    for band in bands:
+        if not band.closed:
+            for c in sorted({0, len(band.columns) - 1}):
+                ends.append((band, c))
+    for x in range(len(ends)):
+        for y in range(x + 1, len(ends)):
+            (ba, ca), (bb, cb) = ends[x], ends[y]
+            if ba is bb:
+                continue
+            res = _strip_between(ba.columns[ca], bb.columns[cb])
+            if res is None:
+                continue
+            Bo, rows, region, extras = res
+            if region & taken_f:
+                continue
+            taken_f |= region
+            flip = Bo != list(bb.columns[cb])
+            ba.pairs.append((ca, bb, cb, flip, rows, region, extras))
+            ba.has_pair = bb.has_pair = True
 
 
 def _find_sides(band, taken_f, taken_v):
@@ -1054,14 +1200,16 @@ def _find_sides(band, taken_f, taken_v):
     for end, c, f in ends:
         col, edges = band.columns[c], band.col_edges[c]
         res = _next_column(col, edges, f)
+        extras = ([], [])
         if res is not None:
             ncol, rows = res
             region = set(rows)
         else:
             res = _zip_column(col, edges, f, same_count=False)
-            if res is None:
-                continue
-            ncol, rows, region = res
+            if res is not None:
+                ncol, rows, region, extras = res
+        if res is None:
+            continue
         if region & taken_f or any(v in taken_v for v in ncol):
             continue
         taken_f |= region
@@ -1084,45 +1232,52 @@ def analyze(bm, fit_mode=FIT_AUTO, cache=None, whole=True):
     claimed_v = set()
     claimed_f = set()
     claimed_cols = set()
-    for path in extract_selected_paths(bm):
-        if tuple(path) in claimed_cols or tuple(reversed(path)) in claimed_cols:
-            continue
-        band = build_band(path)
-        if band is None:
-            continue
-        inner = band.interior()
-        faces = band.faces()
-        edges = set(e for ce in band.col_edges for e in ce)
-        if inner & claimed_v or faces & claimed_f or edges & claimed_v:
-            continue
-        claimed_v |= inner
-        claimed_v |= edges  # edges and verts never compare equal; one set is fine
-        claimed_f |= faces
-        for col in band.columns:
-            claimed_cols.add(tuple(col))
-        bands.append(band)
+    paths = extract_selected_paths(bm)
+    targets = set(v for p in paths for v in p)
+    path_of = {}
+    for p in paths:
+        for v in p:
+            path_of.setdefault(v, tuple(p))
     if cache is not None:
         bm.verts.index_update()
-    for band in bands:
+    for path in paths:
+        if tuple(path) in claimed_cols or tuple(reversed(path)) in claimed_cols:
+            continue
+        band = build_band(path, targets)
+        if band is None:
+            continue
         _fit_band(band, fit_mode, cache)
-    if not whole:
-        kept = []
-        for band in bands:
-            runs = _selected_runs(band)
-            if (len(runs) == 1 and len(runs[0]) == len(band.columns)) or all(cv.legs for cv in band.curves):
-                kept.append(band)
+        parts = [band]
+        if not whole:
+            # Only the selected columns change (a bevel always as a whole).
+            # Columns left out are not claimed: a selected path lying on one
+            # of them (part of an unselected column) gets its own band.
+            runs = _selected_runs(band, path_of)
+            if not ((len(runs) == 1 and len(runs[0]) == len(band.columns)) or all(cv.legs for cv in band.curves)):
+                parts = []
+                for run in runs:
+                    sub = _sub_band(band, run)
+                    _fit_band(sub, fit_mode, cache)
+                    parts.append(sub)
+        for part in parts:
+            inner = part.interior()
+            faces = part.faces()
+            edges = set(e for ce in part.col_edges for e in ce)
+            if inner & claimed_v or faces & claimed_f or edges & claimed_v:
                 continue
-            for run in runs:
-                sub = _sub_band(band, run)
-                _fit_band(sub, fit_mode, cache)
-                kept.append(sub)
-        bands = kept
+            claimed_v |= inner
+            claimed_v |= edges  # edges and verts never compare equal; one set is fine
+            claimed_f |= faces
+            for col in part.columns:
+                claimed_cols.add(tuple(col))
+            bands.append(part)
     taken_f = set()
     taken_v = set()
     for band in bands:
         taken_f |= band.faces()
         for col in band.columns:
             taken_v.update(col)
+    _find_pairs(bands, taken_f)
     for band in bands:
         _find_sides(band, taken_f, taken_v)
     return bands
@@ -1315,12 +1470,17 @@ def _rebuild_band(bm, bid, band, M, pts, jobs, lookup):
             i = min(m - 1, int((k + 0.5) * m / M))
             fo = strip[i]
             # A zig-zag strip's row face may hold only the other column's edge.
-            if (band.col_edges[c][i] in fo.edges and _face_goes(fo, colA[i], colA[i + 1])) or (
-                    band.col_edges[c][i] not in fo.edges and not _face_goes(fo, colB[i], colB[i + 1])):
-                vs = [A[k], A[k + 1], B[k + 1], B[k]]
-            else:
-                vs = [A[k + 1], A[k], B[k], B[k + 1]]
-            jobs.face(bm, vs, fo)
+            e_start, e_end = band.ends[c] if c < len(band.ends) else ([], [])
+            goes = (band.col_edges[c][i] in fo.edges and _face_goes(fo, colA[i], colA[i + 1])) or (
+                band.col_edges[c][i] not in fo.edges and not _face_goes(fo, colB[i], colB[i + 1]))
+            vs = [A[k], A[k + 1], B[k + 1], B[k]]
+            jobs.face(bm, vs if goes else vs[::-1], fo)
+            # Point i joins point i, the ends too; vertices where other
+            # geometry meets the ends get a face of their own beside them.
+            for at, extra in ((0, e_start), (M - 1, e_end)):
+                if extra and k == at:
+                    ev = [A[0], B[0]] + list(extra)[::-1] if at == 0 else [B[M], A[M]] + list(extra)
+                    jobs.face(bm, ev if goes else ev[::-1], fo)
         # Edges along the new rows: data from the nearest old interior row;
         # seam / sharp marks only go to the one new row closest to each old row.
         if m >= 2 and M >= 2:
@@ -1372,6 +1532,49 @@ def _rebuild_sides(bm, band, M, jobs, tidy=False):
                 j += 1
         done |= region
     return done
+
+
+def _rebuild_pair(bm, band, pair, jobs):
+    """Rebuild the strip between an end column of ``band`` and an end column
+    of another selected band, once both are resampled (or one of them, the
+    other staying as it is): quads where the counts match, otherwise the even
+    pattern mirrored about the middle. Vertices where other geometry meets
+    the ends stay in the end faces."""
+    c, ob, oc, flip, rows, region, (e0, e1) = pair
+    if band.W is None and ob.W is None:
+        return set()
+    col = band.columns[c]
+    A = band.W[c] if band.W is not None else list(col)
+    B = ob.W[oc] if ob.W is not None else list(ob.columns[oc])
+    if flip:
+        B = B[::-1]
+    na, nb = len(A) - 1, len(B) - 1
+    m = band.m
+    goes = _face_goes(rows[0], col[0], col[1])
+    kinds = tidy_pattern(na, nb, closed=False)
+    i = j = 0
+    for t, kind in enumerate(kinds):
+        if kind == 'Q':
+            vs = [A[i], A[i + 1], B[j + 1], B[j]]
+        elif kind == 'A':
+            vs = [A[i], A[i + 1], B[j]]
+        else:
+            vs = [A[i], B[j + 1], B[j]]
+        src = rows[min(m - 1, int((min(i, na - 1) + 0.5) * m / max(na, 1)))]
+        jobs.face(bm, vs if goes else list(reversed(vs)), src)
+        # The end points are joined directly; vertices where other geometry
+        # meets the ends get a face of their own beside the strip.
+        if t == 0 and e0:
+            ev = [A[0], B[0]] + list(e0)[::-1]
+            jobs.face(bm, ev if goes else ev[::-1], src)
+        if t == len(kinds) - 1 and e1:
+            ev = [B[-1], A[-1]] + list(e1)
+            jobs.face(bm, ev if goes else ev[::-1], src)
+        if kind in ('Q', 'A'):
+            i += 1
+        if kind in ('Q', 'B'):
+            j += 1
+    return set(region)
 
 
 def _column_scales(band, scale):
@@ -1439,7 +1642,7 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0, t
         if M is None:
             continue
         M = max(MIN_SEGMENTS, min(MAX_SEGMENTS, int(M)))
-        if M == band.m and not (even or shift or force or scale != 1.0 or (tidy and band.sides)):
+        if M == band.m and not (even or shift or force or scale != 1.0 or (tidy and (band.sides or band.has_pair))):
             continue
         pts = [cv.new_points(M, even, shift, k) for cv, k in zip(band.curves, _column_scales(band, scale))]
         if scale != 1.0:
@@ -1447,7 +1650,7 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0, t
                 col[0].co = Vector(P[0].tolist())
                 col[-1].co = Vector(P[-1].tolist())
         zig_side = any((len(ncol) - 1 == M or tidy) and region != set(rows) for _, ncol, rows, region in band.sides)
-        if M == band.m and not band.extra and not zig_side:
+        if M == band.m and not band.extra and not zig_side and not (tidy and band.has_pair):
             # Same count: only move the vertices (a zig-zag strip is rebuilt).
             for col, P in zip(band.columns, pts):
                 for i in range(1, M):
@@ -1477,6 +1680,9 @@ def resample(bm, bands, counts, even=False, shift=0.0, force=False, scale=1.0, t
             old_inner.extend(col[1:-1])
         for ce in band.col_edges:
             old_col_edges.extend(ce)
+    for band in bands:
+        for pair in band.pairs:
+            handled |= _rebuild_pair(bm, band, pair, jobs)
 
     affected = []
     seen = set(handled)

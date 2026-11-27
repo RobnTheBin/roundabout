@@ -1727,6 +1727,132 @@ def curve_selected_only_changes_just_that_curve():
 
 
 @test
+def curves_zigzag_with_extra_vertex_at_the_end():
+    # Two selected curves (same count) joined by a zig-zag, but at one end
+    # they are joined through an extra vertex where other geometry meets
+    # them. They still form one band; the strip becomes quads and the extra
+    # vertex stays in the end face.
+    m = 6
+    bm = bmesh.new()
+    A = [bm.verts.new((math.cos(math.pi * i / m), 0.0, math.sin(math.pi * i / m))) for i in range(m + 1)]
+    B = [bm.verts.new((1.3 * math.cos(math.pi * i / m), 0.0, 1.3 * math.sin(math.pi * i / m))) for i in range(m + 1)]
+    x = bm.verts.new((-1.15, 0.0, -0.2))
+    y = bm.verts.new((-1.15, 0.0, -0.6))
+    for i in range(m - 1):
+        if i % 2:
+            bm.faces.new((A[i], A[i + 1], B[i + 1]))
+            bm.faces.new((A[i], B[i + 1], B[i]))
+        else:
+            bm.faces.new((A[i], A[i + 1], B[i + 1], B[i]))
+    bm.faces.new((A[m - 1], A[m], x, B[m], B[m - 1]))
+    bm.faces.new((A[m], y, x))
+    bm.faces.new((x, y, B[m]))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    ob = new_object_from_bm(bm, "ExtraEnd")
+    bm = edit(ob)
+    select_edges(bm, lambda e: all(v.index < 2 * (m + 1) for v in e.verts)
+                 and e.verts[0].index // (m + 1) == e.verts[1].index // (m + 1))
+    bmesh.update_edit_mesh(ob.data)
+    bands = curves.analyze(bmesh.from_edit_mesh(ob.data), whole=False)
+    expect(len(bands) == 1 and len(bands[0].columns) == 2, f"{[(b.m, len(b.columns)) for b in bands]}")
+    run_op(delta=3, whole_shape=False)
+    bm = bmesh.from_edit_mesh(ob.data)
+    xs = [v for v in bm.verts if (v.co - Vector((-1.15, 0.0, -0.2))).length < 1e-6]
+    strip = [f for f in bm.faces if xs[0] not in f.verts or len(f.verts) > 3]
+    strip = [f for f in strip if not (len(f.verts) == 3 and any((v.co - Vector((-1.15, 0.0, -0.6))).length < 1e-6 for v in f.verts))]
+    sizes = sorted(len(f.verts) for f in strip)
+    expect(sizes == [4] * (m + 3), f"strip face sizes {sizes} (expected {m + 3} quads)")
+    tri = [f for f in bm.faces if xs[0] in f.verts and len(f.verts) == 3
+           and not any((v.co - Vector((-1.15, 0.0, -0.6))).length < 1e-6 for v in f.verts)]
+    expect(len(tri) == 1, "the extra vertex should sit in its own triangle beside the strip")
+    expect(not check_topology(bm, expect_boundary=None, closed_orientation=True), check_topology(bm, expect_boundary=None))
+
+
+@test
+def tidy_rebuilds_strip_between_two_selected_curves():
+    # Two selected curves with the same count, joined by a shifted zig-zag
+    # (each A point linked to the B point one step further on) and, at one
+    # end, through an extra vertex where other geometry meets them. Tidy at
+    # the same count: the ends stay joined, the inside becomes quads that pair
+    # point i with point i, and the extra vertex stays in the end face.
+    m = 6
+    bm = bmesh.new()
+    A = [bm.verts.new((math.cos(math.pi * i / m), 0.0, math.sin(math.pi * i / m))) for i in range(m + 1)]
+    B = [bm.verts.new((1.3 * math.cos(math.pi * i / m), 0.0, 1.3 * math.sin(math.pi * i / m))) for i in range(m + 1)]
+    x = bm.verts.new((-1.15, 0.0, -0.15))
+    y = bm.verts.new((-1.15, 0.0, -0.6))
+    bm.faces.new((A[0], B[1], B[0]))
+    for i in range(m - 1):
+        bm.faces.new((A[i], A[i + 1], B[i + 2], B[i + 1])) if i + 2 <= m else None
+    bm.faces.new((A[m - 1], A[m], x, B[m]))
+    bm.faces.new((A[m], y, x))
+    bm.faces.new((x, y, B[m]))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    ob = new_object_from_bm(bm, "Shifted")
+    bm = edit(ob)
+    n = m + 1
+    select_edges(bm, lambda e: all(v.index < 2 * n for v in e.verts) and e.verts[0].index // n == e.verts[1].index // n)
+    bmesh.update_edit_mesh(ob.data)
+    run_op(delta=0, whole_shape=False, tidy=True)
+    bm = bmesh.from_edit_mesh(ob.data)
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+    xv = next(v for v in bm.verts if (v.co - Vector((-1.15, 0.0, -0.15))).length < 1e-6)
+    yv = next(v for v in bm.verts if (v.co - Vector((-1.15, 0.0, -0.6))).length < 1e-6)
+    strip = [f for f in bm.faces if yv not in f.verts]
+    sizes = sorted(len(f.verts) for f in strip)
+    expect(sizes == [3] + [4] * m, f"strip faces {sizes} (expected {m} quads, end points joined, and the extra vertex's triangle)")
+    # every edge across the strip joins points at the same angle
+    worst = 0.0
+    for f in strip:
+        for e in f.edges:
+            a, b = e.verts
+            if xv in (a, b):
+                continue
+            if abs(a.co.length - b.co.length) > 0.2:
+                worst = max(worst, abs(math.atan2(a.co.z, a.co.x) - math.atan2(b.co.z, b.co.x)))
+    expect(worst < 1e-3, f"edges across the strip are skewed by {math.degrees(worst):.1f} deg")
+
+
+@test
+def staggered_curves_both_found_and_matched():
+    # Two selected curves of 7 and 6 segments side by side; the 6 one lines
+    # up with the last 6 edges of the 7 one (a triangle fills the first
+    # step). Both must be found as curves of their own, so E / D (and any
+    # exact count) change both.
+    bm = bmesh.new()
+    A = [bm.verts.new((math.cos(math.pi * i / 7), 0.0, math.sin(math.pi * i / 7))) for i in range(8)]
+    B = [bm.verts.new((1.3 * math.cos(math.pi * (j + 1) / 7), 0.0, 1.3 * math.sin(math.pi * (j + 1) / 7)))
+         for j in range(7)]
+    Bx = bm.verts.new((1.3, 0.0, 0.0))
+    bm.faces.new((A[0], A[1], B[0], Bx))
+    for j in range(6):
+        bm.faces.new((A[j + 1], A[j + 2], B[j + 1], B[j]))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    ob = new_object_from_bm(bm, "Staggered")
+    bm = edit(ob)
+    a_set = set(range(8))
+    b_set = set(range(8, 15))
+    select_edges(bm, lambda e: {v.index for v in e.verts} <= a_set or {v.index for v in e.verts} <= b_set)
+    bmesh.update_edit_mesh(ob.data)
+    bands = curves.analyze(bmesh.from_edit_mesh(ob.data), whole=False)
+    expect(sorted(b.m for b in bands) == [6, 7], f"bands {[(b.m, len(b.columns)) for b in bands]} (expected curves of 6 and 7)")
+    run_op(use_absolute=True, segments=7, whole_shape=False)
+    bm = bmesh.from_edit_mesh(ob.data)
+    paths = curves.extract_selected_paths(bm)
+    expect(sorted(len(p) - 1 for p in paths) == [7, 7], f"after matching: {[len(p) - 1 for p in paths]}")
+    expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+    # The strip between them: quads, plus the end face that keeps the extra
+    # vertex (the column across from the 7 one runs on past the 6 one).
+    expect(sorted(len(f.verts) for f in bm.faces) == [3] + [4] * 7, f"faces {sorted(len(f.verts) for f in bm.faces)}")
+    for segs in (4, 9):
+        run_op(use_absolute=True, segments=segs, whole_shape=False, tidy=True)
+        bm = bmesh.from_edit_mesh(ob.data)
+        sizes = sorted(len(f.verts) for f in bm.faces)
+        expect(sizes == [3] + [4] * segs, f"{segs}: faces {sizes}")
+        expect(not check_topology(bm, expect_boundary=None), check_topology(bm, expect_boundary=None))
+
+
+@test
 def curves_across_zigzag_strip_become_one_band():
     # Parallel arches with the same segment count, where the strip between
     # two of them is a zig-zag of triangles (what resampling two separate

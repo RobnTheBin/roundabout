@@ -302,6 +302,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
 
         self.delta = 0
         self.use_absolute = False
+        self._match_base = None  # counts E / D match against (before the first E / D)
         self.segments = self._primary
         self.fit_mode = core.FIT_AUTO
         self._initial_radius = 0.0 if kind == KIND_RESTORE else 1.0
@@ -435,6 +436,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
 
     def _step(self, direction, snap):
         self._typed = ""
+        self._match_base = None
         cur = self._current()
         if snap:
             target = (cur // 4 + 1) * 4 if direction > 0 else ((cur - 1) // 4) * 4
@@ -624,6 +626,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
         self._apply(context)
 
     def _cancel(self, context):
+        self._match_base = None
         self.delta = 0
         self.use_absolute = False
         self.fit_mode = core.FIT_AUTO
@@ -740,6 +743,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             return {'RUNNING_MODAL'}
 
         if t in DIGITS:
+            self._match_base = None
             self._typed = (self._typed + DIGITS[t])[-4:]
             value = int(self._typed)
             if value >= self._min_segments:
@@ -751,6 +755,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             return {'RUNNING_MODAL'}
 
         if t == 'BACK_SPACE':
+            self._match_base = None
             self._typed = self._typed[:-1]
             if self._typed and int(self._typed) >= self._min_segments:
                 self.segments = min(int(self._typed), self._max_segments)
@@ -763,8 +768,12 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             return {'RUNNING_MODAL'}
 
         if t in {'E', 'D'}:
-            # Match every shape to the highest (E) or lowest (D) current count.
-            counts = [n for st in self._states for n in self._targets(self._orig(st))]
+            # Match every shape to the highest (E) or lowest (D) count. The
+            # counts from before the first E / D are remembered, so E and D
+            # switch between the two (until the counts are changed otherwise).
+            if self._match_base is None:
+                self._match_base = [n for st in self._states for n in self._targets(self._orig(st))]
+            counts = self._match_base
             if counts:
                 self._typed = ""
                 self.use_absolute = True
@@ -774,6 +783,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             return {'RUNNING_MODAL'}
 
         if t == 'SPACE' and self.kind == KIND_RINGS:
+            self._match_base = None
             self._add_similar(context)
             return {'RUNNING_MODAL'}
 
@@ -787,6 +797,7 @@ With Whole Shape, every ring connected through quad strips (bevels, insets, inne
             key = "rings" if self.kind == KIND_RINGS else "curves_w"
             if any(st[key][not self.whole_shape] for st in self._states):
                 self.whole_shape = not self.whole_shape
+                self._match_base = None
                 # Remembered: the next Alt+T starts in this mode, until W is
                 # pressed again (also stored in the add-on preferences).
                 _prefs(context).default_whole_shape = self.whole_shape
@@ -854,8 +865,10 @@ def _draw_hud(op):
     parts(x + w + 8 * ui, y - 4 * ui, line)
 
     rows = []
-    if not op._uniform and not op.use_absolute:
-        rows.append([("match counts", TEXT), ("   E max · D min", KEY)])
+    if not restoring:
+        differ = not op._uniform and not op.use_absolute
+        rows.append([("match counts" if differ else "match max / min", VALUE if differ else TEXT),
+                     ("   E max · D min" if differ else "   E / D", KEY)])
     press = op._press or {}
     dragging = press.get("drag")
     if not op._has_radius:

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "roundabout"
-version = "1.0.0"
+version = "1.0.1"
 name = "Roundabout"
 tagline = "Resample loops, arcs and bevels with the mouse wheel"
 maintainer = "Robin Mariančík"

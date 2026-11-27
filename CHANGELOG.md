@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
 
 - Radius works on a chamfer looped around a shape with sharp corners; the corner (miter) edges no longer turn it off for the whole loop, and they scale in step with the rest.
 - Radius works on hand-made chamfers whose faces are slightly twisted, and on chamfer edges that only touch quads when the rest of the loop is a real chamfer.
